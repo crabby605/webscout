@@ -248,10 +248,100 @@
     set(t, k, v) { t[k] = v; return true; },
   });
   def("CanvasRenderingContext2D", function CanvasRenderingContext2D() {});
+
+  // WebGL: answers the queries fingerprinters make (vendor, renderer, limits,
+  // extensions) with values matching the identity's browser/OS; draws nothing.
+  // ponytail: one GPU per browser/OS combo; readPixels stays all-zero.
+  const ua = navigator.userAgent, win = __ws_config.platform === "Windows";
+  const firefox = /Firefox\//.test(ua), chromium = /Chrome\//.test(ua);
+  const gpu = firefox
+    ? (win ? ["Google Inc. (Intel)", "ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0), or similar"] : ["Apple", "Apple M2, or similar"])
+    : chromium
+      ? (win ? ["Google Inc. (Intel)", "ANGLE (Intel, Intel(R) UHD Graphics 630 (0x00003E92) Direct3D11 vs_5_0 ps_5_0, D3D11)"]
+             : ["Google Inc. (Apple)", "ANGLE (Apple, ANGLE Metal Renderer: Apple M2, Unspecified Version)"])
+      : ["Apple Inc.", "Apple GPU"];
+  const GL = {
+    VENDOR: 0x1F00, RENDERER: 0x1F01, VERSION: 0x1F02, SHADING_LANGUAGE_VERSION: 0x8B8C,
+    MAX_TEXTURE_SIZE: 0x0D33, MAX_VIEWPORT_DIMS: 0x0D3A, MAX_RENDERBUFFER_SIZE: 0x84E8, MAX_CUBE_MAP_TEXTURE_SIZE: 0x851C,
+    ALIASED_LINE_WIDTH_RANGE: 0x846E, ALIASED_POINT_SIZE_RANGE: 0x846D, MAX_VERTEX_ATTRIBS: 0x8869,
+    MAX_VERTEX_UNIFORM_VECTORS: 0x8DFB, MAX_FRAGMENT_UNIFORM_VECTORS: 0x8DFD, MAX_VARYING_VECTORS: 0x8DFC,
+    MAX_COMBINED_TEXTURE_IMAGE_UNITS: 0x8B4D, MAX_VERTEX_TEXTURE_IMAGE_UNITS: 0x8B4C, MAX_TEXTURE_IMAGE_UNITS: 0x8872,
+    RED_BITS: 0x0D52, GREEN_BITS: 0x0D53, BLUE_BITS: 0x0D54, ALPHA_BITS: 0x0D55, DEPTH_BITS: 0x0D56, STENCIL_BITS: 0x0D57,
+    LOW_FLOAT: 0x8DF0, MEDIUM_FLOAT: 0x8DF1, HIGH_FLOAT: 0x8DF2, LOW_INT: 0x8DF3, MEDIUM_INT: 0x8DF4, HIGH_INT: 0x8DF5,
+    VERTEX_SHADER: 0x8B31, FRAGMENT_SHADER: 0x8B30, NO_ERROR: 0,
+  };
+  const glParams = webgl2 => ({
+    [GL.VENDOR]: firefox ? "Mozilla" : "WebKit",
+    [GL.RENDERER]: firefox ? "Mozilla" : "WebKit WebGL",
+    [GL.VERSION]: webgl2 ? `WebGL 2.0${chromium ? " (OpenGL ES 3.0 Chromium)" : ""}` : `WebGL 1.0${chromium ? " (OpenGL ES 2.0 Chromium)" : ""}`,
+    [GL.SHADING_LANGUAGE_VERSION]: webgl2 ? `WebGL GLSL ES 3.00${chromium ? " (OpenGL ES GLSL ES 3.0 Chromium)" : ""}` : `WebGL GLSL ES 1.0${chromium ? " (OpenGL ES GLSL ES 1.0 Chromium)" : ""}`,
+    0x9245: gpu[0], 0x9246: gpu[1], 0x84FF: 16,
+    [GL.MAX_TEXTURE_SIZE]: 16384, [GL.MAX_RENDERBUFFER_SIZE]: 16384, [GL.MAX_CUBE_MAP_TEXTURE_SIZE]: 16384,
+    [GL.MAX_VIEWPORT_DIMS]: new Int32Array([16384, 16384]),
+    [GL.ALIASED_LINE_WIDTH_RANGE]: new Float32Array([1, 1]), [GL.ALIASED_POINT_SIZE_RANGE]: new Float32Array([1, 511]),
+    [GL.MAX_VERTEX_ATTRIBS]: 16, [GL.MAX_VERTEX_UNIFORM_VECTORS]: 1024, [GL.MAX_FRAGMENT_UNIFORM_VECTORS]: 1024,
+    [GL.MAX_VARYING_VECTORS]: 30, [GL.MAX_COMBINED_TEXTURE_IMAGE_UNITS]: 32, [GL.MAX_VERTEX_TEXTURE_IMAGE_UNITS]: 16,
+    [GL.MAX_TEXTURE_IMAGE_UNITS]: 16, [GL.RED_BITS]: 8, [GL.GREEN_BITS]: 8, [GL.BLUE_BITS]: 8, [GL.ALPHA_BITS]: 8,
+    [GL.DEPTH_BITS]: 24, [GL.STENCIL_BITS]: 0,
+  });
+  const glExtensions = ["ANGLE_instanced_arrays", "EXT_blend_minmax", "EXT_color_buffer_half_float", "EXT_float_blend",
+    "EXT_frag_depth", "EXT_shader_texture_lod", "EXT_texture_compression_rgtc", "EXT_texture_filter_anisotropic", "EXT_sRGB",
+    "KHR_parallel_shader_compile", "OES_element_index_uint", "OES_fbo_render_mipmap", "OES_standard_derivatives",
+    "OES_texture_float", "OES_texture_float_linear", "OES_texture_half_float", "OES_texture_half_float_linear",
+    "OES_vertex_array_object", "WEBGL_color_buffer_float", "WEBGL_compressed_texture_s3tc", "WEBGL_compressed_texture_s3tc_srgb",
+    "WEBGL_debug_renderer_info", "WEBGL_depth_texture", "WEBGL_draw_buffers", "WEBGL_lose_context", "WEBGL_multi_draw"];
+  const glExtension = name => !glExtensions.includes(name) ? null
+    : name === "WEBGL_debug_renderer_info" ? { UNMASKED_VENDOR_WEBGL: 0x9245, UNMASKED_RENDERER_WEBGL: 0x9246 }
+    : name === "EXT_texture_filter_anisotropic" ? { TEXTURE_MAX_ANISOTROPY_EXT: 0x84FE, MAX_TEXTURE_MAX_ANISOTROPY_EXT: 0x84FF }
+    : name === "WEBGL_lose_context" ? { loseContext: noop, restoreContext: noop }
+    : {};
+  const WebGLRenderingContext = function WebGLRenderingContext() { throw new TypeError("Illegal constructor"); };
+  const WebGL2RenderingContext = function WebGL2RenderingContext() { throw new TypeError("Illegal constructor"); };
+  Object.assign(WebGLRenderingContext, GL);
+  Object.assign(WebGL2RenderingContext, GL);
+  def("WebGLRenderingContext", WebGLRenderingContext);
+  def("WebGL2RenderingContext", WebGL2RenderingContext);
+  const glCtx = (canvas, webgl2) => {
+    const params = glParams(webgl2);
+    const methods = {
+      canvas,
+      get drawingBufferWidth() { return Number(canvas.getAttribute("width")) || 300; },
+      get drawingBufferHeight() { return Number(canvas.getAttribute("height")) || 150; },
+      getParameter: p => params[p] ?? null,
+      getExtension: glExtension,
+      getSupportedExtensions: () => [...glExtensions],
+      getContextAttributes: () => ({ alpha: true, antialias: true, depth: true, desynchronized: false, failIfMajorPerformanceCaveat: false,
+        powerPreference: "default", premultipliedAlpha: true, preserveDrawingBuffer: false, stencil: false, xrCompatible: false }),
+      getShaderPrecisionFormat: (_s, type) => type >= GL.LOW_INT ? { rangeMin: 31, rangeMax: 30, precision: 0 } : { rangeMin: 127, rangeMax: 127, precision: 23 },
+      isContextLost: () => false,
+      getError: () => 0,
+      getShaderParameter: () => true, getProgramParameter: () => true, getShaderInfoLog: () => "", getProgramInfoLog: () => "",
+      checkFramebufferStatus: () => 0x8CD5, // FRAMEBUFFER_COMPLETE
+    };
+    const target = Object.create((webgl2 ? WebGL2RenderingContext : WebGLRenderingContext).prototype);
+    return new Proxy(target, {
+      get(t, k) {
+        if (k in methods) return methods[k];
+        if (k in GL) return GL[k];
+        if (k in t) return t[k];
+        if (typeof k !== "string" || /^[A-Z_0-9]+$/.test(k)) return undefined;
+        if (k.startsWith("create")) return () => ({});
+        if (k.startsWith("is")) return () => false;
+        if (k.startsWith("get")) return () => null;
+        return noop;
+      },
+      set(t, k, v) { t[k] = v; return true; },
+    });
+  };
   const canvasProto = (L.HTMLCanvasElement || L.HTMLElement).prototype;
-  // ponytail: 2D only; WebGL returns null (pages fall back or show "unsupported").
-  canvasProto.getContext = function (type) { return type === "2d" ? (this._ctx ||= ctx2d(this)) : null; };
-  canvasProto.toDataURL = () => "data:,";
+  canvasProto.getContext = function (type) {
+    if (type === "2d") return (this._ctx ||= ctx2d(this));
+    if (type === "webgl" || type === "experimental-webgl") return (this._gl ||= glCtx(this, false));
+    if (type === "webgl2") return (this._gl2 ||= glCtx(this, true));
+    return null;
+  };
+  // ponytail: always a blank 1x1 PNG. Canvas-hash fingerprints see a constant, not a real render.
+  canvasProto.toDataURL = () => "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
   canvasProto.toBlob = cb => later(() => cb(null));
 
   // --- misc -------------------------------------------------------------------

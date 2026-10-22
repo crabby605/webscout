@@ -10,7 +10,7 @@ use crate::http::HttpResponse;
 #[derive(Debug, Clone)]
 pub struct CachedEntry {
     pub status: u16,
-    pub headers: reqwest::header::HeaderMap,
+    pub headers: wreq::header::HeaderMap,
     pub body: Bytes,
     pub cached_at: Instant,
     pub ttl: Duration,
@@ -78,7 +78,7 @@ impl RequestCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reqwest::header::HeaderMap;
+    use wreq::header::HeaderMap;
 
     #[tokio::test]
     async fn test_cache_ttl_expiry() {

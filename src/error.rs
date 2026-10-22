@@ -3,7 +3,7 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum ScoutError {
     #[error("HTTP error: {0}")]
-    Http(#[from] reqwest::Error),
+    Http(#[from] wreq::Error),
     #[error("TLS error: {0}")]
     Tls(String),
     #[error("Timeout error: {0}")]

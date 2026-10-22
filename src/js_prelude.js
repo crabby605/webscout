@@ -76,20 +76,130 @@
   document.hasFocus = () => true;
 
   // --- navigator / screen / viewport --------------------------------------
+  // Bot checks probe the *shape* too: real browsers expose these as getters on
+  // interface prototypes (Navigator.prototype etc.), never as own properties.
   const ua = cfg.userAgent;
   const [vw, vh] = cfg.viewport.split("x").map(Number);
-  G.navigator = {
+  const chromium = /Chrome\//.test(ua), firefox = /Firefox\//.test(ua);
+  const ifaces = [];
+  const iface = (name, members = {}) => {
+    const C = { [name]: function () { throw new TypeError("Illegal constructor"); } }[name];
+    Object.defineProperties(C.prototype, Object.getOwnPropertyDescriptors(members));
+    Object.defineProperty(C.prototype, Symbol.toStringTag, { value: name, configurable: true });
+    G[name] = C;
+    ifaces.push(C);
+    return C;
+  };
+  // Fields non-enumerable: in browsers they're prototype getters, invisible to
+  // JSON.stringify / Object.keys (and plugin <-> mimeType links would be circular).
+  const make = (C, fields = {}) => {
+    const o = Object.create(C.prototype);
+    for (const [k, value] of Object.entries(fields)) Object.defineProperty(o, k, { value, writable: true, configurable: true });
+    return o;
+  };
+  // Array-likes (PluginArray, Plugin, MimeTypeArray): indexed items + namedItem(key).
+  const lists = new WeakMap();
+  const listMembers = key => ({
+    get length() { return lists.get(this).length; },
+    item(i) { return lists.get(this)[i] ?? null; },
+    namedItem(n) { return lists.get(this).find(x => x[key] === n) ?? null; },
+    refresh() {},
+    [Symbol.iterator]() { return lists.get(this)[Symbol.iterator](); },
+  });
+  const makeList = (C, items, fields) => {
+    const o = make(C, fields);
+    lists.set(o, items);
+    items.forEach((x, i) => Object.defineProperty(o, i, { value: x, enumerable: true }));
+    return o;
+  };
+  const PluginArray = iface("PluginArray", listMembers("name"));
+  const Plugin = iface("Plugin", listMembers("type"));
+  const MimeTypeArray = iface("MimeTypeArray", listMembers("type"));
+  const MimeType = iface("MimeType");
+  // Every current browser reports this same fixed list of built-in PDF viewers.
+  const pdfTypes = ["application/pdf", "text/pdf"].map(type => make(MimeType, { type, suffixes: "pdf", description: "Portable Document Format" }));
+  const plugins = ["PDF Viewer", "Chrome PDF Viewer", "Chromium PDF Viewer", "Microsoft Edge PDF Viewer", "WebKit built-in PDF"]
+    .map(name => makeList(Plugin, pdfTypes, { name, filename: "internal-pdf-viewer", description: "Portable Document Format" }));
+  for (const t of pdfTypes) Object.defineProperty(t, "enabledPlugin", { value: plugins[0] });
+
+  const PermissionStatus = iface("PermissionStatus", { addEventListener() {}, removeEventListener() {}, dispatchEvent: () => true });
+  const Permissions = iface("Permissions", {
+    query(desc) {
+      const name = desc?.name;
+      if (typeof name !== "string") return Promise.reject(new TypeError("Failed to execute 'query' on 'Permissions'"));
+      // "prompt" matches Notification.permission === "default", as in a fresh profile.
+      return Promise.resolve(make(PermissionStatus, { name, state: "prompt", onchange: null }));
+    },
+  });
+  const permissions = make(Permissions);
+
+  // Client hints, parsed from the sec-ch-ua header the HTTP layer sends, so both agree.
+  const brands = [...(cfg.secChUa || "").matchAll(/"([^"]+)";v="([^"]+)"/g)].map(([, brand, version]) => ({ brand, version }));
+  const fullVersion = (ua.match(/Chrome\/([\d.]+)/) || [])[1] || "";
+  const NavigatorUAData = iface("NavigatorUAData", {
+    get brands() { return brands.map(b => ({ ...b })); },
+    get mobile() { return false; },
+    get platform() { return cfg.platform; },
+    getHighEntropyValues(hints) {
+      const all = {
+        architecture: "x86", bitness: "64", model: "", wow64: false, formFactors: ["Desktop"],
+        platformVersion: cfg.platform === "Windows" ? "10.0.0" : "15.0.0",
+        uaFullVersion: fullVersion,
+        // GREASE brands ("Not/A)Brand") keep their fake version.
+        fullVersionList: brands.map(b => ({ brand: b.brand, version: /Brand/.test(b.brand) ? `${b.version}.0.0.0` : fullVersion })),
+      };
+      const out = { brands: this.brands, mobile: false, platform: cfg.platform };
+      for (const h of hints || []) if (h in all) out[h] = all[h];
+      return Promise.resolve(out);
+    },
+    toJSON() { return { brands: this.brands, mobile: false, platform: cfg.platform }; },
+  });
+
+  const nav = {
     userAgent: ua,
-    appVersion: ua.replace(/^Mozilla\//, ""),
+    appVersion: firefox ? `5.0 (${cfg.platform === "Windows" ? "Windows" : "Macintosh"})` : ua.replace(/^Mozilla\//, ""),
     appName: "Netscape", appCodeName: "Mozilla", product: "Gecko",
+    productSub: firefox ? "20100101" : "20030107",
     platform: { Windows: "Win32", macOS: "MacIntel", Linux: "Linux x86_64" }[cfg.platform] || cfg.platform,
-    vendor: /Chrome/.test(ua) ? "Google Inc." : /Safari/.test(ua) ? "Apple Computer, Inc." : "",
-    language: cfg.languages[0], languages: cfg.languages,
+    vendor: chromium ? "Google Inc." : /Safari/.test(ua) && !firefox ? "Apple Computer, Inc." : "",
+    vendorSub: "",
+    language: cfg.languages[0], languages: Object.freeze([...cfg.languages]),
     cookieEnabled: true, onLine: true, webdriver: false, doNotTrack: null,
-    hardwareConcurrency: 8, maxTouchPoints: 0,
-    plugins: [], mimeTypes: [],
-    sendBeacon: () => true,
-    javaEnabled: () => false,
+    hardwareConcurrency: 8, maxTouchPoints: 0, pdfViewerEnabled: true,
+    plugins: makeList(PluginArray, plugins), mimeTypes: makeList(MimeTypeArray, pdfTypes),
+    permissions,
+    // Device labels/ids stay empty until a permission grant, as in a fresh profile.
+    mediaDevices: {
+      enumerateDevices: () => Promise.resolve(["audioinput", "videoinput", "audiooutput"].map(kind => ({ kind, label: "", deviceId: "", groupId: "" }))),
+      getUserMedia: () => Promise.reject(new DOMException("Permission denied", "NotAllowedError")),
+      addEventListener() {}, removeEventListener() {},
+    },
+  };
+  if (chromium) Object.assign(nav, {
+    deviceMemory: 8,
+    userAgentData: make(NavigatorUAData),
+    connection: { effectiveType: "4g", rtt: 50, downlink: 10, saveData: false, addEventListener() {}, removeEventListener() {} },
+  });
+  if (firefox) Object.assign(nav, {
+    oscpu: cfg.platform === "Windows" ? "Windows NT 10.0; Win64; x64" : "Intel Mac OS X 10.15",
+    buildID: "20181001000000",
+  });
+  const navMembers = { sendBeacon: () => true, javaEnabled: () => false, vibrate: () => true };
+  if (chromium) navMembers.getBattery = () => Promise.resolve({ charging: true, level: 1, chargingTime: 0, dischargingTime: Infinity, addEventListener() {}, removeEventListener() {} });
+  for (const [k, v] of Object.entries(nav)) {
+    const get = () => v;
+    Object.defineProperty(get, "name", { value: `get ${k}` });
+    Object.defineProperty(navMembers, k, { get, enumerable: true, configurable: true });
+  }
+  G.navigator = make(iface("Navigator", navMembers));
+  if (chromium) G.chrome = {
+    app: {
+      isInstalled: false, getDetails: () => null, getIsInstalled: () => false, runningState: () => "cannot_run",
+      InstallState: { DISABLED: "disabled", INSTALLED: "installed", NOT_INSTALLED: "not_installed" },
+      RunningState: { CANNOT_RUN: "cannot_run", READY_TO_RUN: "ready_to_run", RUNNING: "running" },
+    },
+    csi: () => ({ startE: Date.now(), onloadT: Date.now(), pageT: 1000, tran: 15 }),
+    loadTimes: () => ({ requestTime: Date.now() / 1000, startLoadTime: Date.now() / 1000, navigationType: "Other", wasFetchedViaSpdy: true, npnNegotiatedProtocol: "h2", connectionInfo: "h2" }),
   };
   G.screen = { width: vw, height: vh, availWidth: vw, availHeight: vh - 40, colorDepth: 24, pixelDepth: 24 };
   Object.assign(G, {
@@ -121,6 +231,50 @@
     },
     configurable: true,
   });
+  // linkedom's setters assume strings; browsers coerce (`el.innerHTML = 0`, `= null`).
+  for (const k of ["innerHTML", "outerHTML", "textContent"]) {
+    for (let p = L.Element.prototype; p; p = Object.getPrototypeOf(p)) {
+      const d = Object.getOwnPropertyDescriptor(p, k);
+      if (!d?.set) continue;
+      Object.defineProperty(p, k, { ...d, set(v) { d.set.call(this, v == null ? "" : String(v)); } });
+      break;
+    }
+  }
+  const HE = (L.HTMLElement || L.Element).prototype;
+  if (!Object.getOwnPropertyDescriptor(HE, "innerText")) {
+    Object.defineProperty(HE, "innerText", {
+      get() { return this.textContent; },
+      set(v) { this.textContent = v; },
+      configurable: true,
+    });
+  }
+  // Same-origin iframes: their own empty document, and a window that inherits ours,
+  // so iframe.contentWindow.navigator agrees with the top window (fingerprinters compare).
+  const frames = new WeakMap();
+  const frame = el => {
+    if (!frames.has(el)) {
+      const doc = implementation.createHTMLDocument("");
+      const win = Object.create(G, { document: { value: doc }, frameElement: { value: el } });
+      Object.assign(win, { window: win, self: win, parent: G, top: G });
+      frames.set(el, { doc, win });
+    }
+    return frames.get(el);
+  };
+  const IF = (L.HTMLIFrameElement || L.HTMLElement).prototype;
+  Object.defineProperty(IF, "contentDocument", { get() { return this.tagName === "IFRAME" ? frame(this).doc : undefined; }, configurable: true });
+  Object.defineProperty(IF, "contentWindow", { get() { return this.tagName === "IFRAME" ? frame(this).win : undefined; }, configurable: true });
+  // jQuery's init feature-tests document.implementation.createHTMLDocument.
+  const DOMImplementation = iface("DOMImplementation", {
+    createHTMLDocument(title) {
+      const d = L.parseHTML("<!DOCTYPE html><html><head></head><body></body></html>").document;
+      if (title !== undefined) d.title = String(title);
+      return d;
+    },
+    createDocumentType: (name, publicId = "", systemId = "") => ({ nodeType: 10, name, publicId, systemId }),
+    hasFeature: () => true,
+  });
+  const implementation = make(DOMImplementation);
+  Object.defineProperty(document, "implementation", { get: () => implementation, configurable: true });
   const E = L.Element.prototype;
   E.getBoundingClientRect ??= () => ({ x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0 });
   E.getClientRects ??= () => [];
@@ -225,7 +379,7 @@
     now = Math.max(now, t.at);
     if (t.every) t.at = now + t.every; else timers.delete(id);
     try {
-      typeof t.fn === "function" ? t.fn(...t.args) : (0, eval)(String(t.fn));
+      typeof t.fn === "function" ? t.fn(...t.args) : __ws_eval(String(t.fn), loc.href);
     } catch (e) {
       log("error", [e]);
     }
@@ -391,7 +545,7 @@
     currentScript = s;
     written = "";
     try {
-      (0, eval)(code);
+      __ws_eval(code, src ? new URL(src, loc).href : loc.href);
     } catch (e) {
       __ws_log("error", `script ${src || "(inline)"}: ${errText(e)}`);
     }
@@ -446,6 +600,8 @@
     }
   };
   for (const k of Object.keys(L)) if (typeof L[k] === "function") { native.add(L[k]); markProto(L[k].prototype); }
+  for (const C of ifaces) { native.add(C); markProto(C.prototype); }
+  if (G.chrome) [G.chrome, G.chrome.app].forEach(markProto);
   for (const o of [G.navigator, G.location, G.history, G.performance, G.console, G.localStorage, G.crypto, document]) markProto(o);
   for (const k of ["fetch", "setTimeout", "setInterval", "clearTimeout", "clearInterval", "requestAnimationFrame",
     "cancelAnimationFrame", "requestIdleCallback", "cancelIdleCallback", "matchMedia", "getComputedStyle",
@@ -457,7 +613,7 @@
   }
   const fnToString = Function.prototype.toString;
   const toString = function () {
-    return native.has(this) ? `function ${this.name.replace(/^(get|set|bound) /, "")}() { [native code] }` : fnToString.call(this);
+    return native.has(this) ? `function ${this.name.startsWith("bound ") ? "" : this.name}() { [native code] }` : fnToString.call(this);
   };
   native.add(toString);
   Function.prototype.toString = toString;
