@@ -111,34 +111,39 @@ async fn browser(sessions: &Sessions, name: Option<&str>) -> Result<(String, Arc
     Ok((name, b))
 }
 
-async fn fetch(sessions: &Sessions, req: &FetchReq) -> Result<(HttpResponse, Dom), ApiError> {
-    if req.js {
-        let _ = req.js_timeout_ms;
-        return Err(ScoutError::Unsupported("js=true is not supported yet".into()).into());
-    }
+/// Fetches the page (running its JS if asked) → (response, DOM, final HTML, JS report).
+async fn fetch(sessions: &Sessions, req: &FetchReq) -> Result<(HttpResponse, Dom, String, Option<Value>), ApiError> {
     let (name, b) = browser(sessions, req.session.as_deref()).await?;
     // "stealth" = human-ish random pause when the caller didn't set one.
     let delay = req.delay.as_deref()
         .or((req.strategy.as_deref() == Some("stealth")).then_some("300-1200"))
         .and_then(crate::parse_delay);
     let resp = b.client.get(&req.url, delay).await?;
+    let mut html = resp.text();
+    let mut console = None;
+    if (req.js || req.strategy.as_deref() == Some("js")) && resp.is_html() {
+        let r = crate::render_js(html, resp.final_url.clone(), &b.session, &b.client, req.js_timeout_ms.unwrap_or(5000)).await?;
+        html = r.html;
+        console = Some(json!({ "console": r.console, "timed_out": r.timed_out }));
+    }
     b.session.save(&name)?;
-    let dom = Dom::parse(&resp.text(), &resp.final_url);
-    Ok((resp, dom))
+    let dom = Dom::parse(&html, &resp.final_url);
+    Ok((resp, dom, html, console))
 }
 
 async fn scrape(State(s): State<Sessions>, Json(req): Json<FetchReq>) -> ApiResult {
-    let (resp, dom) = fetch(&s, &req).await?;
+    let (resp, dom, html, js) = fetch(&s, &req).await?;
     let envelope = json!({
         "url": req.url,
         "final_url": resp.final_url,
         "status": resp.status,
         "state": format!("{:?}", resp.classify()),
+        "js": js,
     });
     let mut out = envelope.as_object().unwrap().clone();
     match req.format.as_deref().unwrap_or("json") {
         "raw" => {
-            out.insert("content".into(), resp.text().into());
+            out.insert("content".into(), html.into());
         }
         // ponytail: title + visible text, not real HTML→Markdown; convert headings/lists if readers need structure.
         "markdown" => {

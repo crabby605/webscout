@@ -6,7 +6,32 @@ Built to look indistinguishable from real browsers (Chrome/Firefox/Safari) at th
 ## Running Output
 ```bash
 cargo run -- --url "https://nowsecure.nl"
+
+# Query the DOM (CSS selectors), page text, links
+webscout -u https://news.ycombinator.com -s '.titleline > a'
+webscout -u https://example.com --text
+webscout -u https://example.com --links
+
+# Run the page's JavaScript first (client-rendered / SPA pages)
+webscout -u https://quotes.toscrape.com/js/ --js -s '.quote .text'
+
+# HTTP/JSON daemon used by the MCP server (mcp/webscout_mcp.py)
+webscout serve --port 8080
+webscout session show mcp
 ```
+
+## JavaScript DOM
+`--js` (or `"js": true` over the API) runs page scripts in QuickJS against a full DOM:
+[linkedom](https://github.com/WebReflection/linkedom), bundled with core-js polyfills into
+`vendor/dom-bundle.js` (rebuild: `cd vendor && bun install && bun run build`).
+`src/js_prelude.js` and `src/js_webapis.js` supply the browser environment around it.
+
+- Classic + ES module scripts (imports fetched through the session, JSON imports, dynamic `import()`), dynamically inserted scripts, `document.write`
+- `fetch`, `XMLHttpRequest`, `document.cookie` over the session's identity and cookie jar
+- Timers on a virtual clock (a 3s `setTimeout` runs immediately), promises, `DOMContentLoaded`/`load`
+- `URL`, `crypto`, `AbortController`, `Blob`/`FormData`, `MessageChannel`, en-US `Intl`, no-op canvas 2D, storage
+- Not supported: layout (sizes are 0), WebAssembly, WebGL, WebSocket/Worker (they fail cleanly), IndexedDB
+- Each run is capped by `--js-timeout` (default 5000ms) and a 256MB heap
 
 ## Directory Structure
 ```text

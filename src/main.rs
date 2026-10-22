@@ -1,6 +1,7 @@
 pub mod dom;
 pub mod error;
 pub mod identity;
+pub mod js;
 pub mod session;
 pub mod http;
 pub mod serve;
@@ -38,6 +39,14 @@ struct Args {
     #[arg(long)]
     text: bool,
 
+    /// Run the page's JavaScript against a full DOM before extracting
+    #[arg(long)]
+    js: bool,
+
+    /// JS time budget in ms
+    #[arg(long, default_value_t = 5000)]
+    js_timeout: u64,
+
     /// Print absolute links found on the page
     #[arg(long)]
     links: bool,
@@ -64,6 +73,23 @@ enum Cmd {
 enum SessionCmd {
     Show { name: String },
     Delete { name: String },
+}
+
+/// Runs page JS on a blocking thread (QuickJS is synchronous).
+pub async fn render_js(html: String, url: String, session: &Session, client: &HttpClient, timeout_ms: u64) -> error::Result<js::Rendered> {
+    let identity = session.identity.clone();
+    let cookies = std::sync::Arc::clone(&session.cookies);
+    let client = client.clone();
+    tokio::task::spawn_blocking(move || js::render(js::Page {
+        html: &html,
+        url: &url,
+        identity: &identity,
+        client,
+        cookies,
+        timeout: std::time::Duration::from_millis(timeout_ms),
+    }))
+    .await
+    .map_err(|e| error::ScoutError::Parse(format!("js thread: {e}")))?
 }
 
 pub fn parse_delay(val: &str) -> Option<std::ops::Range<u64>> {
@@ -133,8 +159,14 @@ async fn main() -> Result<(), error::ScoutError> {
 
     // Output stats rather than raw dumps
     if response.is_html() {
-        let html = response.text();
+        let mut html = response.text();
         info!("Received HTML content. Length: {} bytes", html.len());
+        if args.js {
+            let r = render_js(html, response.final_url.clone(), &session, &client, args.js_timeout).await?;
+            r.console.iter().for_each(|l| info!("[js] {l}"));
+            info!("JS done (timed out: {}). Rendered {} bytes", r.timed_out, r.html.len());
+            html = r.html;
+        }
 
         let dom = dom::Dom::parse(&html, &response.final_url);
         info!("Title: {}", dom.title().unwrap_or_default());
