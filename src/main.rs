@@ -3,8 +3,9 @@ pub mod error;
 pub mod identity;
 pub mod session;
 pub mod http;
+pub mod serve;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use tracing::{info, error};
 use tracing_subscriber;
 
@@ -12,11 +13,14 @@ use crate::http::client::HttpClient;
 use crate::session::Session;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(author, version, about, long_about = None, args_conflicts_with_subcommands = true)]
 struct Args {
+    #[command(subcommand)]
+    cmd: Option<Cmd>,
+
     /// Target URL to fetch
-    #[arg(short, long)]
-    url: String,
+    #[arg(short, long, required = true)]
+    url: Option<String>,
 
     /// Delay in ms before fetch (e.g., "100-500")
     #[arg(short, long)]
@@ -39,7 +43,30 @@ struct Args {
     links: bool,
 }
 
-fn parse_delay(val: &str) -> Option<std::ops::Range<u64>> {
+#[derive(Subcommand, Debug)]
+enum Cmd {
+    /// Run the HTTP/JSON daemon used by the MCP server
+    Serve {
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// 0 = let the OS pick a free port
+        #[arg(long, default_value_t = 0)]
+        port: u16,
+    },
+    /// Inspect or delete a saved session
+    Session {
+        #[command(subcommand)]
+        action: SessionCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SessionCmd {
+    Show { name: String },
+    Delete { name: String },
+}
+
+pub fn parse_delay(val: &str) -> Option<std::ops::Range<u64>> {
     let parts: Vec<&str> = val.split('-').collect();
     if parts.len() == 2 {
         if let (Ok(start), Ok(end)) = (parts[0].parse::<u64>(), parts[1].parse::<u64>()) {
@@ -57,6 +84,25 @@ async fn main() -> Result<(), error::ScoutError> {
     tracing_subscriber::fmt().with_writer(std::io::stderr).init();
 
     let args = Args::parse();
+    match args.cmd {
+        Some(Cmd::Serve { host, port }) => return serve::run(&host, port).await,
+        Some(Cmd::Session { action: SessionCmd::Show { name } }) => {
+            let exists = Session::exists(&name);
+            let s = Session::load(&name)?;
+            println!("session:  {name}{}", if exists { "" } else { " (not saved yet)" });
+            println!("agent:    {}", s.identity.user_agent);
+            println!("platform: {}", s.identity.platform);
+            println!("cookies:  {}", s.cookies.read().unwrap().iter_unexpired().count());
+            return Ok(());
+        }
+        Some(Cmd::Session { action: SessionCmd::Delete { name } }) => {
+            let existed = Session::delete(&name)?;
+            println!("{}", if existed { format!("deleted {name}") } else { format!("{name} did not exist") });
+            return Ok(());
+        }
+        None => {}
+    }
+    let url = args.url.expect("clap enforces --url");
     let delay_range = args.delay.and_then(|d| parse_delay(&d));
 
     info!("Initializing WebScout Engine");
@@ -74,10 +120,10 @@ async fn main() -> Result<(), error::ScoutError> {
         }
     };
 
-    info!("Fetching {}...", args.url);
+    info!("Fetching {}...", url);
 
     // Execute the request
-    let response = client.get(&args.url, delay_range).await?;
+    let response = client.get(&url, delay_range).await?;
 
     info!("Response received. Status: {}, Final URL: {}", response.status, response.final_url);
 
@@ -100,7 +146,7 @@ async fn main() -> Result<(), error::ScoutError> {
             println!("{}", dom.text());
         }
         if args.links {
-            dom.links().iter().for_each(|l| println!("{l}"));
+            dom.links().iter().for_each(|l| println!("{}", l.href));
         }
     } else if let Some(ct) = response.content_type() {
         info!("Received content of type: {}. Length: {} bytes", ct, response.body.len());
