@@ -89,6 +89,7 @@ impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
     }
 }
 
+#[derive(Clone)]
 pub struct HttpClient {
     pub client: Client,
 }
@@ -214,6 +215,27 @@ impl HttpClient {
             headers,
             body,
         })
+    }
+
+    /// Arbitrary request with per-request header overrides (used by page JS: fetch, XHR, scripts).
+    #[tracing::instrument(skip(self, headers, body))]
+    pub async fn request(&self, method: &str, url: &str, headers: &[(String, String)], body: Option<String>) -> Result<HttpResponse> {
+        let method = reqwest::Method::from_bytes(method.to_ascii_uppercase().as_bytes())
+            .map_err(|e| ScoutError::Parse(e.to_string()))?;
+        let mut req = self.client.request(method, url);
+        for (k, v) in headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
+        if let Some(b) = body {
+            req = req.body(b);
+        }
+        let res = req.send().await?;
+        let status = res.status().as_u16();
+        let final_url = res.url().to_string();
+        let headers = res.headers().clone();
+        let body = res.bytes().await?;
+
+        Ok(HttpResponse { status, final_url, headers, body })
     }
 
     #[tracing::instrument(skip(self, fields))]
