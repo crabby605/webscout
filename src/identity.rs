@@ -1,6 +1,7 @@
 use rand::seq::SliceRandom;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Identity {
     pub user_agent: String,
     pub accept_language: String,

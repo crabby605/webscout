@@ -1,10 +1,35 @@
 use scraper::{ElementRef, Html, Selector};
+use serde::Serialize;
+use serde_json::{Map, Value};
 use url::Url;
 
 use crate::error::{Result, ScoutError};
 
 /// Tags whose text is never shown to a reader.
 const HIDDEN: &[&str] = &["script", "style", "noscript", "template", "head"];
+
+#[derive(Debug, Serialize)]
+pub struct Link {
+    pub href: String,
+    pub text: String,
+    pub rel: Option<String>,
+    pub is_external: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Form {
+    pub action: Option<String>,
+    pub method: String,
+    pub fields: Vec<Field>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Field {
+    pub tag: String,
+    pub name: Option<String>,
+    pub kind: Option<String>,
+    pub value: Option<String>,
+}
 
 /// Parsed HTML document (html5ever, spec-compliant error recovery).
 pub struct Dom {
@@ -44,24 +69,71 @@ impl Dom {
         visible_text(self.doc.root_element())
     }
 
-    /// Absolute http(s) link targets, in document order, deduplicated.
-    pub fn links(&self) -> Vec<String> {
-        let mut out: Vec<String> = Vec::new();
+    /// Absolute http(s) links, in document order, deduplicated by href.
+    pub fn links(&self) -> Vec<Link> {
+        let mut out: Vec<Link> = Vec::new();
         for a in self.doc.select(&sel("a[href]").unwrap()) {
-            let href = a.value().attr("href").unwrap_or_default();
-            let url = match &self.base {
-                Some(b) => b.join(href).ok(),
-                None => Url::parse(href).ok(),
+            let Some(mut u) = self.resolve(a.value().attr("href").unwrap_or_default())
+                .filter(|u| matches!(u.scheme(), "http" | "https"))
+            else {
+                continue;
             };
-            if let Some(mut u) = url.filter(|u| matches!(u.scheme(), "http" | "https")) {
-                u.set_fragment(None);
-                let s = u.to_string();
-                if !out.contains(&s) {
-                    out.push(s);
-                }
+            u.set_fragment(None);
+            let href = u.to_string();
+            if out.iter().any(|l| l.href == href) {
+                continue;
             }
+            out.push(Link {
+                is_external: self.base.as_ref().is_some_and(|b| b.host_str() != u.host_str()),
+                href,
+                text: visible_text(a),
+                rel: a.value().attr("rel").map(str::to_string),
+            });
         }
         out
+    }
+
+    pub fn forms(&self) -> Vec<Form> {
+        let fields = sel("input, select, textarea, button").unwrap();
+        self.doc.select(&sel("form").unwrap()).map(|f| Form {
+            action: f.value().attr("action").and_then(|a| self.resolve(a)).map(|u| u.to_string()),
+            method: f.value().attr("method").unwrap_or("get").to_ascii_lowercase(),
+            fields: f.select(&fields).map(|e| Field {
+                tag: e.value().name().to_string(),
+                name: e.value().attr("name").map(str::to_string),
+                kind: e.value().attr("type").map(str::to_string),
+                value: e.value().attr("value").map(str::to_string),
+            }).collect(),
+        }).collect()
+    }
+
+    /// Title, <meta> name/property → content, and parsed JSON-LD blocks.
+    pub fn metadata(&self) -> Value {
+        let mut meta = Map::new();
+        for m in self.doc.select(&sel("meta[content]").unwrap()) {
+            let v = m.value();
+            if let Some(k) = v.attr("property").or(v.attr("name")).or(v.attr("itemprop")) {
+                meta.insert(k.to_string(), v.attr("content").unwrap_or_default().into());
+            }
+        }
+        let json_ld: Vec<Value> = self.doc
+            .select(&sel(r#"script[type="application/ld+json"]"#).unwrap())
+            .filter_map(|s| serde_json::from_str(&s.text().collect::<String>()).ok())
+            .collect();
+        serde_json::json!({
+            "title": self.title(),
+            "canonical": self.doc.select(&sel(r#"link[rel="canonical"][href]"#).unwrap()).next()
+                .and_then(|l| self.resolve(l.value().attr("href")?)).map(|u| u.to_string()),
+            "meta": meta,
+            "json_ld": json_ld,
+        })
+    }
+
+    fn resolve(&self, href: &str) -> Option<Url> {
+        match &self.base {
+            Some(b) => b.join(href).ok(),
+            None => Url::parse(href).ok(),
+        }
     }
 }
 
@@ -105,9 +177,25 @@ mod tests {
         assert_eq!(d.title().as_deref(), Some("Hi there"));
         assert_eq!(d.select_text("p.x").unwrap(), ["One two", "three"]);
         assert_eq!(d.select_html("b").unwrap(), ["<b>two</b>"]);
-        assert_eq!(d.links(), ["https://ex.com/docs/a", "https://other.org/"]);
+        let links: Vec<_> = d.links().into_iter().map(|l| (l.href, l.is_external)).collect();
+        assert_eq!(links, [("https://ex.com/docs/a".into(), false), ("https://other.org/".into(), true)]);
         let text = d.text();
         assert!(text.contains("unclosed") && !text.contains("var a") && !text.contains("p{}"));
         assert!(d.select_text("p[").is_err());
+    }
+
+    #[test]
+    fn forms_and_metadata() {
+        let d = Dom::parse(r#"<head><meta property="og:title" content="OG">
+            <script type="application/ld+json">{"@type":"Thing"}</script></head>
+            <form action="/go" method=POST><input name=q value=hi><select name=s></select></form>"#,
+            "https://ex.com/x");
+        let f = &d.forms()[0];
+        assert_eq!((f.action.as_deref(), f.method.as_str()), (Some("https://ex.com/go"), "post"));
+        assert_eq!(f.fields.len(), 2);
+        assert_eq!(f.fields[0].value.as_deref(), Some("hi"));
+        let m = d.metadata();
+        assert_eq!(m["meta"]["og:title"], "OG");
+        assert_eq!(m["json_ld"][0]["@type"], "Thing");
     }
 }

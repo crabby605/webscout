@@ -191,8 +191,8 @@ impl HttpClient {
     async fn delay_if_needed(delay_range: Option<std::ops::Range<u64>>) {
         if let Some(range) = delay_range {
             if range.start < range.end {
-                let mut rng = rand::thread_rng();
-                let delay = rng.gen_range(range);
+                // ThreadRng is !Send, so it must not live across the await.
+                let delay = rand::thread_rng().gen_range(range);
                 sleep(Duration::from_millis(delay)).await;
             }
         }
