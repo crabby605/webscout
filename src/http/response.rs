@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use reqwest::header::HeaderMap;
+use wreq::header::HeaderMap;
 
 #[derive(Debug)]
 pub struct HttpResponse {

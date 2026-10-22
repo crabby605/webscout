@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use cookie_store::CookieStore;
 use rquickjs::loader::{ImportAttributes, Loader, Resolver};
 use rquickjs::module::Declared;
+use rquickjs::context::EvalOptions;
 use rquickjs::{CatchResultExt, Context, Ctx, Exception, Function, Module, Runtime};
 use serde::Serialize;
 use serde_json::json;
@@ -122,6 +123,7 @@ pub fn render(page: Page) -> Result<Rendered> {
             "html": html,
             "url": page.url,
             "userAgent": page.identity.user_agent,
+            "secChUa": page.identity.sec_ch_ua,
             "platform": page.identity.platform,
             "languages": languages,
             "viewport": page.identity.viewport,
@@ -181,6 +183,16 @@ fn install_host_fns<'js>(
     logs: Rc<RefCell<Vec<String>>>,
 ) -> rquickjs::Result<()> {
     let g = ctx.globals();
+
+    // Classic scripts share one global lexical scope (a top-level `const` in one
+    // script is visible to the next). Indirect eval would scope each one separately.
+    g.set("__ws_eval", Function::new(ctx.clone(), |ctx: Ctx<'js>, code: String, name: String| {
+        let mut opts = EvalOptions::default();
+        opts.global = true;
+        opts.strict = false;
+        opts.filename = Some(name);
+        ctx.eval_with_options::<(), _>(code, opts)
+    })?)?;
 
     g.set("__ws_http", Function::new(ctx.clone(), move |ctx: Ctx<'js>, method: String, url: String, headers: String, body: Option<String>| {
         let headers: Vec<(String, String)> = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&headers)
@@ -264,6 +276,37 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn passes_bot_checks() {
+        // The probes bot.sannysoft.com / fingerprinters run, plus the DOM gaps that crashed them.
+        let r = run(r#"<html><body><pre id=out></pre><script>
+            const gl = document.createElement('canvas').getContext('webgl');
+            const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+            const out = [
+              Object.getOwnPropertyNames(navigator).length,
+              navigator.webdriver,
+              Object.prototype.toString.call(navigator),
+              Object.getOwnPropertyDescriptor(Navigator.prototype, 'webdriver').get.toString(),
+              navigator.plugins instanceof PluginArray && navigator.plugins[0].toString(),
+              navigator.plugins.length,
+              navigator.mimeTypes[0].enabledPlugin.name,
+              !!gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL),
+              (document.body.firstChild.innerHTML = 0, document.body.firstChild.innerHTML),
+              document.implementation.createHTMLDocument('').body.nodeName,
+              /Chrome/.test(navigator.userAgent) === !!window.chrome,
+            ];
+            navigator.permissions.query({name: 'notifications'}).then(s => {
+              out.push(s.state, Notification.permission);
+              document.getElementById('out').textContent = JSON.stringify(out);
+            });
+            </script></body></html>"#, 5000).await;
+        let d = crate::dom::Dom::parse(&r.html, "https://ex.com/");
+        let text = d.select_text("#out").unwrap().join("");
+        let out: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|_| panic!("no output; console: {:?}", r.console));
+        assert_eq!(out, json!([0, false, "[object Navigator]", "function get webdriver() { [native code] }",
+            "[object Plugin]", 5, "PDF Viewer", true, "0", "BODY", true, "prompt", "default"]), "{:?}", r.console);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn runs_page_scripts() {
         let r = run(r#"<html><body><div id=app></div>
             <script>
@@ -280,6 +323,8 @@ mod tests {
               console.log('hello', {a: 1});
             </script>
             <script>document.write('<p id=w>written</p>')</script>
+            <script>const shared = 'yes';</script>
+            <script>document.body.setAttribute('data-shared', shared)</script>
             <script>throw new Error('boom')</script>
             <script type="application/json">{"not": "run"}</script>
             </body></html>"#, 5000).await;
@@ -290,6 +335,7 @@ mod tests {
         assert_eq!(attr("data-timer=yes"), 1, "virtual-clock timer ran without waiting");
         assert_eq!(attr("data-order='micro,dcl'"), 1, "{:?}", d.select_html("body").unwrap()[0].get(..200));
         assert_eq!(attr("data-cookie='k=v'"), 1);
+        assert_eq!(attr("data-shared=yes"), 1, "top-level const visible to later scripts");
         assert_eq!(attr("data-env='/a/b|https://ex.com/a/x|function|false|aGk='"), 1);
         assert!(r.console.iter().any(|l| l == r#"log: hello {"a":1}"#), "{:?}", r.console);
         assert!(r.console.iter().any(|l| l.contains("boom")), "{:?}", r.console);

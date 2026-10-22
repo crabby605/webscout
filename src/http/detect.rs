@@ -59,7 +59,7 @@ pub fn classify(response: &HttpResponse) -> PageState {
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use reqwest::header::HeaderMap;
+    use wreq::header::HeaderMap;
 
     #[test]
     fn test_classify_normal() {
