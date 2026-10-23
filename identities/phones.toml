@@ -1,0 +1,224 @@
+# Phone identities. Same fields as pcs.toml. Chrome on Android hides the model in its
+# user agent ("Android 10; K"), so model / os_version surface only through client hints
+# (navigator.userAgentData) — the screen, dpr and GPU are what tell devices apart.
+# iOS browsers are all WebKit; only Safari is offered there.
+
+[[device]]
+name = "galaxy-s25-ultra"
+kind = "phone"
+vendor = "Samsung"
+model = "SM-S938B"
+os = "android"
+os_version = "15.0.0"
+browsers = ["chrome", "chrome", "chrome", "firefox", "brave"]
+screen = [384, 832]
+dpr = 2.8125
+cpu_cores = 8
+ram_gb = 12
+touch = 5
+arch = "arm"
+gpu = { vendor = "Qualcomm", renderer = "Adreno (TM) 830" }
+
+[[device]]
+name = "galaxy-s24"
+kind = "phone"
+vendor = "Samsung"
+model = "SM-S921B"
+os = "android"
+os_version = "15.0.0"
+browsers = ["chrome", "chrome", "firefox"]
+screen = [360, 780]
+dpr = 3.0
+cpu_cores = 10
+ram_gb = 8
+touch = 5
+arch = "arm"
+gpu = { vendor = "Samsung", renderer = "Samsung Xclipse 940" }
+
+[[device]]
+name = "galaxy-a55"
+kind = "phone"
+vendor = "Samsung"
+model = "SM-A556E"
+os = "android"
+os_version = "14.0.0"
+browsers = ["chrome"]
+screen = [384, 832]
+dpr = 2.8125
+cpu_cores = 8
+ram_gb = 8
+touch = 5
+arch = "arm"
+gpu = { vendor = "Samsung", renderer = "Samsung Xclipse 530" }
+
+[[device]]
+name = "iqoo-13"
+kind = "phone"
+vendor = "iQOO"
+model = "I2401"
+os = "android"
+os_version = "15.0.0"
+browsers = ["chrome", "chrome", "brave"]
+screen = [412, 905]
+dpr = 3.5
+cpu_cores = 8
+ram_gb = 12
+touch = 5
+arch = "arm"
+gpu = { vendor = "Qualcomm", renderer = "Adreno (TM) 830" }
+
+[[device]]
+name = "iqoo-neo9-pro"
+kind = "phone"
+vendor = "iQOO"
+model = "I2304"
+os = "android"
+os_version = "14.0.0"
+browsers = ["chrome"]
+screen = [412, 915]
+dpr = 3.0625
+cpu_cores = 8
+ram_gb = 8
+touch = 5
+arch = "arm"
+gpu = { vendor = "Qualcomm", renderer = "Adreno (TM) 740" }
+
+[[device]]
+name = "vivo-x200-pro"
+kind = "phone"
+vendor = "vivo"
+model = "V2413"
+os = "android"
+os_version = "15.0.0"
+browsers = ["chrome", "chrome", "firefox"]
+screen = [412, 915]
+dpr = 3.0625
+cpu_cores = 8
+ram_gb = 16
+touch = 5
+arch = "arm"
+gpu = { vendor = "ARM", renderer = "Mali-G925-Immortalis MC12" }
+
+[[device]]
+name = "vivo-v40"
+kind = "phone"
+vendor = "vivo"
+model = "V2348"
+os = "android"
+os_version = "14.0.0"
+browsers = ["chrome"]
+screen = [412, 915]
+dpr = 2.625
+cpu_cores = 8
+ram_gb = 8
+touch = 5
+arch = "arm"
+gpu = { vendor = "Qualcomm", renderer = "Adreno (TM) 720" }
+
+[[device]]
+name = "oppo-find-x8"
+kind = "phone"
+vendor = "OPPO"
+model = "CPH2651"
+os = "android"
+os_version = "15.0.0"
+browsers = ["chrome", "chrome", "firefox"]
+screen = [412, 905]
+dpr = 3.0
+cpu_cores = 8
+ram_gb = 12
+touch = 5
+arch = "arm"
+gpu = { vendor = "ARM", renderer = "Mali-G925-Immortalis MC12" }
+
+[[device]]
+name = "oppo-reno12-pro"
+kind = "phone"
+vendor = "OPPO"
+model = "CPH2629"
+os = "android"
+os_version = "14.0.0"
+browsers = ["chrome"]
+screen = [412, 915]
+dpr = 2.625
+cpu_cores = 8
+ram_gb = 12
+touch = 5
+arch = "arm"
+gpu = { vendor = "ARM", renderer = "Mali-G615 MC2" }
+
+[[device]]
+name = "pixel-9"
+kind = "phone"
+vendor = "Google"
+model = "Pixel 9"
+os = "android"
+os_version = "16.0.0"
+browsers = ["chrome", "chrome", "chrome", "firefox", "brave"]
+screen = [412, 923]
+dpr = 2.625
+cpu_cores = 8
+ram_gb = 12
+touch = 5
+arch = "arm"
+gpu = { vendor = "ARM", renderer = "Mali-G715" }
+
+[[device]]
+name = "iphone-16-pro"
+kind = "phone"
+vendor = "Apple"
+os = "ios"
+os_version = "26.0.0"
+browsers = ["safari"]
+screen = [402, 874]
+dpr = 3.0
+cpu_cores = 6
+ram_gb = 8
+touch = 5
+arch = "arm"
+gpu = { vendor = "Apple Inc.", renderer = "Apple GPU" }
+
+[[device]]
+name = "iphone-16-pro-max"
+kind = "phone"
+vendor = "Apple"
+os = "ios"
+os_version = "26.0.0"
+browsers = ["safari"]
+screen = [440, 956]
+dpr = 3.0
+cpu_cores = 6
+ram_gb = 8
+touch = 5
+arch = "arm"
+gpu = { vendor = "Apple Inc.", renderer = "Apple GPU" }
+
+[[device]]
+name = "iphone-15"
+kind = "phone"
+vendor = "Apple"
+os = "ios"
+os_version = "26.0.0"
+browsers = ["safari"]
+screen = [393, 852]
+dpr = 3.0
+cpu_cores = 6
+ram_gb = 6
+touch = 5
+arch = "arm"
+gpu = { vendor = "Apple Inc.", renderer = "Apple GPU" }
+
+[[device]]
+name = "iphone-13"
+kind = "phone"
+vendor = "Apple"
+os = "ios"
+os_version = "18.6.0"
+browsers = ["safari"]
+screen = [390, 844]
+dpr = 3.0
+cpu_cores = 6
+ram_gb = 4
+touch = 5
+arch = "arm"
+gpu = { vendor = "Apple Inc.", renderer = "Apple GPU" }

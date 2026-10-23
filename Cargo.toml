@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "time", "net", "signal"] }
+tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "time", "net", "signal", "process", "sync"] }
 cookie_store = "0.21"
 rand = "0.8"
 uuid = { version = "1.0", features = ["v4", "serde"] }
@@ -20,5 +20,6 @@ tracing-subscriber = "0.3.23"
 scraper = "0.29.0"
 axum = { version = "0.8", features = ["macros"] }
 rquickjs = { version = "0.14.0", features = ["loader"] }
-wreq = { version = "=6.0.0-rc.31", features = ["gzip", "brotli", "deflate", "zstd", "cookies", "json", "form"] }
-wreq-util = { version = "=3.0.0-rc.14", features = ["emulation-serde"] }
+wreq = { version = "=6.0.0-rc.31", features = ["gzip", "brotli", "deflate", "zstd", "cookies", "json", "form", "socks", "ws"] }
+wreq-util = { version = "=3.0.0-rc.14", features = ["emulation-serde", "emulation-compression"] }
+toml = "0.8"

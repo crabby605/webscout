@@ -3,17 +3,22 @@ use tokio::time::{sleep, Duration};
 use rand::Rng;
 use wreq::{Client, Uri, Version, redirect::Policy};
 use wreq::cookie::Cookies;
-use wreq::header::HeaderValue;
+use wreq::header::{HeaderMap, HeaderName, HeaderValue, OrigHeaderMap};
 use url::Url;
 use std::sync::RwLock;
 
+use crate::identity::Identity;
 use crate::session::Session;
 use crate::http::HttpResponse;
+use crate::http::headers::{self, Dest, Req};
 use crate::error::{Result, ScoutError};
 
 #[derive(Clone)]
 pub struct HttpClient {
-    pub client: Client,
+    client: Client,
+    identity: Arc<Identity>,
+    /// The emulation profile's own header values, for http::headers to draw from.
+    base: Arc<HeaderMap>,
 }
 
 struct SharedCookieStore(Arc<RwLock<cookie_store::CookieStore>>);
@@ -62,27 +67,22 @@ impl std::fmt::Debug for HttpClient {
 impl HttpClient {
     #[tracing::instrument(skip(session))]
     pub fn build(session: &Session) -> Result<HttpClient> {
-        // The emulation profile supplies TLS, HTTP/2 settings, and headers (UA,
-        // sec-ch-ua, accept-*, header order) exactly as that browser sends them.
-        // ...except the claimed version, which Identity keeps current.
-        let mut version = wreq::header::HeaderMap::new();
+        // The emulation profile supplies TLS and HTTP/2 settings; headers are built per
+        // request (http::headers) since a navigation, a fetch() and a script load differ.
         let id = &session.identity;
-        for (k, v) in [("user-agent", Some(&id.user_agent)), ("sec-ch-ua", id.sec_ch_ua.as_ref())] {
-            if let Some(v) = v.and_then(|v| HeaderValue::from_str(v).ok()) {
-                version.insert(k, v);
-            }
+        let mut builder = Client::builder();
+        if let Some(p) = &id.proxy {
+            builder = builder.proxy(wreq::Proxy::all(p.as_str()).map_err(ScoutError::Http)?);
         }
-        let client = Client::builder()
+        let client = builder
             .emulation(id.emulation())
-            .default_headers(version)
             .cookie_provider(Arc::new(SharedCookieStore(Arc::clone(&session.cookies))))
             .redirect(Policy::limited(10))
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(30))
             .build()
             .map_err(ScoutError::Http)?;
-
-        Ok(HttpClient { client })
+        Ok(HttpClient { client, identity: Arc::new(id.clone()), base: Arc::new(id.emulation_headers()) })
     }
 
     async fn delay_if_needed(delay_range: Option<std::ops::Range<u64>>) {
@@ -95,33 +95,36 @@ impl HttpClient {
         }
     }
 
+    /// A navigation typed into the address bar.
     #[tracing::instrument(skip(self))]
     pub async fn get(&self, url: &str, delay_range: Option<std::ops::Range<u64>>) -> Result<HttpResponse> {
         Self::delay_if_needed(delay_range).await;
-
-        let res = self.client.get(url).send().await?;
-        let status = res.status().as_u16();
-        let final_url = res.uri().to_string();
-        let headers = res.headers().clone();
-        let body = res.bytes().await?;
-
-        Ok(HttpResponse {
-            status,
-            final_url,
-            headers,
-            body,
-        })
+        self.request("GET", url, Dest::Document, None, &[], None).await
     }
 
-    /// Arbitrary request with per-request header overrides (used by page JS: fetch, XHR, scripts).
-    #[tracing::instrument(skip(self, headers, body))]
-    pub async fn request(&self, method: &str, url: &str, headers: &[(String, String)], body: Option<String>) -> Result<HttpResponse> {
-        let method = wreq::Method::from_bytes(method.to_ascii_uppercase().as_bytes())
-            .map_err(|e| ScoutError::Parse(e.to_string()))?;
-        let mut req = self.client.request(method, url);
-        for (k, v) in headers {
-            req = req.header(k.as_str(), v.as_str());
+    /// Any request, with the claimed browser's exact headers for its kind (`dest`) and
+    /// initiator (`referrer`). `extra` = page-supplied headers (content-type etc.).
+    #[tracing::instrument(skip(self, extra, body))]
+    pub async fn request(&self, method: &str, url: &str, dest: Dest, referrer: Option<&str>,
+                         extra: &[(String, String)], body: Option<String>) -> Result<HttpResponse> {
+        let method = method.to_ascii_uppercase();
+        let target = Url::parse(url).map_err(|e| ScoutError::InvalidUrl(e.to_string()))?;
+        let referrer = referrer.and_then(|r| Url::parse(r).ok());
+        let list = headers::build(&self.identity, &self.base, &Req {
+            method: &method, url: &target, dest, referrer: referrer.as_ref(), extra,
+        });
+        let mut map = HeaderMap::new();
+        let mut order = OrigHeaderMap::new();
+        for (name, value) in list {
+            let (Ok(n), Some(Ok(v))) = (HeaderName::from_bytes(name.as_bytes()), value.as_deref().map(HeaderValue::from_str)) else {
+                order.insert(name); // a slot (cookie) another layer fills
+                continue;
+            };
+            map.append(n, v);
+            order.insert(name);
         }
+        let m = wreq::Method::from_bytes(method.as_bytes()).map_err(|e| ScoutError::Parse(e.to_string()))?;
+        let mut req = self.client.request(m, url).default_headers(false).headers(map).orig_headers(order);
         if let Some(b) = body {
             req = req.body(b);
         }
@@ -130,37 +133,6 @@ impl HttpClient {
         let final_url = res.uri().to_string();
         let headers = res.headers().clone();
         let body = res.bytes().await?;
-
         Ok(HttpResponse { status, final_url, headers, body })
-    }
-
-    #[tracing::instrument(skip(self, fields))]
-    pub async fn post_form(&self, url: &str, fields: &std::collections::HashMap<&str, &str>, delay_range: Option<std::ops::Range<u64>>) -> Result<HttpResponse> {
-        Self::delay_if_needed(delay_range).await;
-
-        let res = self.client.post(url).form(fields).send().await?;
-        let status = res.status().as_u16();
-        let final_url = res.uri().to_string();
-        let headers = res.headers().clone();
-        let body = res.bytes().await?;
-
-        Ok(HttpResponse {
-            status, final_url, headers, body
-        })
-    }
-
-    #[tracing::instrument(skip(self, body_data))]
-    pub async fn post_json(&self, url: &str, body_data: &serde_json::Value, delay_range: Option<std::ops::Range<u64>>) -> Result<HttpResponse> {
-        Self::delay_if_needed(delay_range).await;
-
-        let res = self.client.post(url).json(body_data).send().await?;
-        let status = res.status().as_u16();
-        let final_url = res.uri().to_string();
-        let headers = res.headers().clone();
-        let body = res.bytes().await?;
-
-        Ok(HttpResponse {
-            status, final_url, headers, body
-        })
     }
 }

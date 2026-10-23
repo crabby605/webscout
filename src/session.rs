@@ -46,6 +46,48 @@ impl Session {
     }
 }
 
+/// How to create a session that doesn't exist yet (API request fields / CLI flags).
+#[derive(Debug, Default, Deserialize)]
+pub struct NewSession {
+    /// Identity spec, see Identity::pick ("phone samsung", "windows edge"...).
+    #[serde(default)]
+    pub identity: Option<String>,
+    #[serde(default)]
+    pub proxy: Option<String>,
+    /// An IP, or "random"; see Identity::forwarded_for.
+    #[serde(default)]
+    pub forwarded_for: Option<String>,
+}
+
+impl NewSession {
+    pub fn identity(&self) -> Result<Identity> {
+        let id = match &self.identity {
+            Some(spec) => Identity::pick(spec)?,
+            None => Identity::generate(),
+        };
+        Ok(id.with_network(self.proxy.as_deref(), self.forwarded_for.as_deref()))
+    }
+
+    /// An existing session must already be what was asked for: silently browsing as a
+    /// different device or exit IP than requested is worse than failing.
+    pub fn check(&self, id: &Identity) -> Result<()> {
+        let mismatch = |what: &str| Err(ScoutError::Session(format!(
+            "this session already exists as {} with a different {what}; use a new session name or clear it", id.summary())));
+        if self.identity.as_deref().is_some_and(|s| !id.matches(s)) {
+            return mismatch("identity");
+        }
+        if self.proxy.is_some() && self.proxy != id.proxy {
+            return mismatch("proxy");
+        }
+        if let Some(f) = &self.forwarded_for {
+            if id.forwarded_for.is_none() || (f != "random" && id.forwarded_for.as_ref() != Some(f)) {
+                return mismatch("forwarded_for");
+            }
+        }
+        Ok(())
+    }
+}
+
 /// On-disk sessions live in ~/.webscout/sessions/<name>/{identity,cookies}.json.
 fn session_dir(name: &str) -> Result<std::path::PathBuf> {
     // Names become directory names, so keep them path-safe.
@@ -57,14 +99,17 @@ fn session_dir(name: &str) -> Result<std::path::PathBuf> {
 }
 
 impl Session {
-    /// Load a named session from disk, creating a fresh identity if none exists.
-    pub fn load(name: &str) -> Result<Self> {
+    /// Load a named session from disk. A new (or unreadable) one is created from `opts`;
+    /// they don't change an existing session, since its cookies were earned with that identity.
+    pub fn load(name: &str, opts: &NewSession) -> Result<Self> {
         let dir = session_dir(name)?;
-        let session = Self::new();
-        let identity = std::fs::read_to_string(dir.join("identity.json")).ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or(session.identity);
-        let session = Self { identity, ..session };
+        let saved = std::fs::read_to_string(dir.join("identity.json")).ok()
+            .and_then(|s| serde_json::from_str::<Identity>(&s).ok());
+        let identity = match saved {
+            Some(id) => { opts.check(&id)?; id.refreshed() }
+            None => opts.identity()?,
+        };
+        let session = Self { id: Uuid::new_v4(), identity, cookies: Default::default() };
         // Unreadable jar = start with no cookies rather than fail the request.
         if let Ok(f) = std::fs::File::open(dir.join("cookies.json")) {
             if let Ok(jar) = cookie_store::serde::json::load_all(std::io::BufReader::new(f)) {
@@ -146,10 +191,10 @@ mod tests {
         let url = url::Url::parse("https://ex.com/").unwrap();
         s.cookies.write().unwrap().insert_raw(&cookie_store::Cookie::parse("a=1", &url).unwrap(), &url).unwrap();
         s.save(&name).unwrap();
-        let back = Session::load(&name).unwrap();
+        let back = Session::load(&name, &NewSession::default()).unwrap();
         Session::delete(&name).unwrap();
         assert_eq!(back.identity.user_agent, s.identity.user_agent);
         assert_eq!(back.cookies.read().unwrap().matches(&url).len(), 1);
-        assert!(Session::load("../x").is_err());
+        assert!(Session::load("../x", &NewSession::default()).is_err());
     }
 }
