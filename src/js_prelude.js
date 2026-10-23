@@ -36,10 +36,20 @@
 
   // --- location / history -------------------------------------------------
   let loc = new URL(cfg.url);
-  const navigate = v => { const u = new URL(v, loc); __ws_log("navigate", u.href); };
+  // A navigation the page (or an action) started. Rust stops this document and loads
+  // the target in a new one, like a browser; the first request wins.
+  G.__ws_nav = null;
+  const requestNav = (url, method = "GET", body = null, type = null) => {
+    const u = new URL(url, loc);
+    if (u.href.split("#")[0] === loc.href.split("#")[0] && u.hash && method === "GET") { loc.hash = u.hash; return; }
+    if (/^(javascript|mailto|tel|data|blob):/i.test(u.protocol)) return;
+    __ws_log("navigate", `${method} ${u.href}`);
+    G.__ws_nav ??= { url: u.href, method, body, contentType: type };
+  };
+  const navigate = v => requestNav(v);
   const location = {
     get href() { return loc.href; }, set href(v) { navigate(v); },
-    assign: navigate, replace: navigate, reload() {},
+    assign: navigate, replace: navigate, reload() { G.__ws_nav ??= { url: loc.href, method: "GET", body: null, contentType: null }; },
     toString() { return loc.href; },
     get hash() { return loc.hash; }, set hash(v) { loc.hash = v; },
   };
@@ -78,9 +88,17 @@
   // --- navigator / screen / viewport --------------------------------------
   // Bot checks probe the *shape* too: real browsers expose these as getters on
   // interface prototypes (Navigator.prototype etc.), never as own properties.
-  const ua = cfg.userAgent;
-  const [vw, vh] = cfg.viewport.split("x").map(Number);
+  const ua = cfg.userAgent, dev = cfg.device, os = dev.os;
   const chromium = /Chrome\//.test(ua), firefox = /Firefox\//.test(ua);
+  const brave = cfg.browser === "brave", opera = cfg.browser === "opera";
+  const desktop = dev.kind === "desktop", phone = dev.kind === "phone";
+  // An iPad asks for desktop sites, so it reports itself as a Mac (with touch points).
+  const ipad = os === "ios" && !phone;
+  const uaPlatform = { windows: "Windows", macos: "macOS", linux: "Linux", android: "Android", ios: "iOS" }[os];
+  // ponytail: fixed browser-UI heights (taskbar/menu bar, tabs+toolbar, mobile status+URL bars).
+  const [sw, sh] = dev.screen;
+  const availH = desktop ? sh - (os === "windows" ? 48 : os === "macos" ? 25 : 27) : sh;
+  const vw = sw, vh = desktop ? availH - 85 : sh - (phone ? 140 : 90);
   const ifaces = [];
   const iface = (name, members = {}) => {
     const C = { [name]: function () { throw new TypeError("Illegal constructor"); } }[name];
@@ -138,35 +156,38 @@
   const fullVersion = (ua.match(/Chrome\/([\d.]+)/) || [])[1] || "";
   const NavigatorUAData = iface("NavigatorUAData", {
     get brands() { return brands.map(b => ({ ...b })); },
-    get mobile() { return false; },
-    get platform() { return cfg.platform; },
+    get mobile() { return phone; },
+    get platform() { return uaPlatform; },
     getHighEntropyValues(hints) {
       const all = {
-        architecture: "x86", bitness: "64", model: "", wow64: false, formFactors: ["Desktop"],
-        platformVersion: cfg.platform === "Windows" ? "10.0.0" : "15.0.0",
+        architecture: dev.arch, bitness: "64", model: dev.model || "", wow64: false,
+        formFactors: [{ desktop: "Desktop", phone: "Mobile", tablet: "Tablet" }[dev.kind]],
+        platformVersion: dev.os_version,
         uaFullVersion: fullVersion,
         // GREASE brands ("Not/A)Brand") keep their fake version.
         fullVersionList: brands.map(b => ({ brand: b.brand, version: /Brand/.test(b.brand) ? `${b.version}.0.0.0` : fullVersion })),
       };
-      const out = { brands: this.brands, mobile: false, platform: cfg.platform };
+      const out = { brands: this.brands, mobile: phone, platform: uaPlatform };
       for (const h of hints || []) if (h in all) out[h] = all[h];
       return Promise.resolve(out);
     },
-    toJSON() { return { brands: this.brands, mobile: false, platform: cfg.platform }; },
+    toJSON() { return { brands: this.brands, mobile: phone, platform: uaPlatform }; },
   });
 
   const nav = {
     userAgent: ua,
-    appVersion: firefox ? `5.0 (${cfg.platform === "Windows" ? "Windows" : "Macintosh"})` : ua.replace(/^Mozilla\//, ""),
+    appVersion: firefox ? `5.0 (${{ windows: "Windows", macos: "Macintosh", linux: "X11" }[os] || `Android ${dev.os_version.split(".")[0]}`})` : ua.replace(/^Mozilla\//, ""),
     appName: "Netscape", appCodeName: "Mozilla", product: "Gecko",
     productSub: firefox ? "20100101" : "20030107",
-    platform: { Windows: "Win32", macOS: "MacIntel", Linux: "Linux x86_64" }[cfg.platform] || cfg.platform,
+    platform: ipad ? "MacIntel" : { windows: "Win32", macos: "MacIntel", linux: "Linux x86_64", android: "Linux armv81", ios: "iPhone" }[os],
     vendor: chromium ? "Google Inc." : /Safari/.test(ua) && !firefox ? "Apple Computer, Inc." : "",
     vendorSub: "",
     language: cfg.languages[0], languages: Object.freeze([...cfg.languages]),
     cookieEnabled: true, onLine: true, webdriver: false, doNotTrack: null,
-    hardwareConcurrency: 8, maxTouchPoints: 0, pdfViewerEnabled: true,
-    plugins: makeList(PluginArray, plugins), mimeTypes: makeList(MimeTypeArray, pdfTypes),
+    hardwareConcurrency: dev.cpu_cores, maxTouchPoints: dev.touch,
+    // Phones and Android tablets have no built-in PDF viewer: empty plugin lists.
+    pdfViewerEnabled: desktop || ipad,
+    plugins: makeList(PluginArray, desktop || ipad ? plugins : []), mimeTypes: makeList(MimeTypeArray, desktop || ipad ? pdfTypes : []),
     permissions,
     // Device labels/ids stay empty until a permission grant, as in a fresh profile.
     mediaDevices: {
@@ -176,12 +197,14 @@
     },
   };
   if (chromium) Object.assign(nav, {
-    deviceMemory: 8,
+    // Rounded down to a power of two and capped at 8, as Chromium does.
+    deviceMemory: Math.min(8, 2 ** Math.floor(Math.log2(dev.ram_gb))),
     userAgentData: make(NavigatorUAData),
-    connection: { effectiveType: "4g", rtt: 50, downlink: 10, saveData: false, addEventListener() {}, removeEventListener() {} },
+    connection: { ...(os === "android" && { type: "wifi" }), effectiveType: "4g", rtt: 50, downlink: 10, saveData: false, addEventListener() {}, removeEventListener() {} },
   });
+  if (brave) Object.assign(nav, { globalPrivacyControl: true, brave: { isBrave: () => Promise.resolve(true) } });
   if (firefox) Object.assign(nav, {
-    oscpu: cfg.platform === "Windows" ? "Windows NT 10.0; Win64; x64" : "Intel Mac OS X 10.15",
+    oscpu: { windows: "Windows NT 10.0; Win64; x64", macos: "Intel Mac OS X 10.15", linux: "Linux x86_64" }[os] || "Linux aarch64",
     buildID: "20181001000000",
   });
   const navMembers = { sendBeacon: () => true, javaEnabled: () => false, vibrate: () => true };
@@ -201,14 +224,20 @@
     csi: () => ({ startE: Date.now(), onloadT: Date.now(), pageT: 1000, tran: 15 }),
     loadTimes: () => ({ requestTime: Date.now() / 1000, startLoadTime: Date.now() / 1000, navigationType: "Other", wasFetchedViaSpdy: true, npnNegotiatedProtocol: "h2", connectionInfo: "h2" }),
   };
-  G.screen = { width: vw, height: vh, availWidth: vw, availHeight: vh - 40, colorDepth: 24, pixelDepth: 24 };
+  if (opera) G.opr = { addons: {} };
+  G.screen = {
+    width: sw, height: sh, availWidth: sw, availHeight: availH, colorDepth: 24, pixelDepth: 24,
+    orientation: { type: sw > sh ? "landscape-primary" : "portrait-primary", angle: 0, onchange: null, addEventListener() {}, removeEventListener() {} },
+  };
   Object.assign(G, {
-    innerWidth: vw, innerHeight: vh, outerWidth: vw, outerHeight: vh,
-    devicePixelRatio: 1, scrollX: 0, scrollY: 0, pageXOffset: 0, pageYOffset: 0,
+    innerWidth: vw, innerHeight: vh, outerWidth: sw, outerHeight: desktop ? availH : vh,
+    devicePixelRatio: dev.dpr, scrollX: 0, scrollY: 0, pageXOffset: 0, pageYOffset: 0,
     scrollTo() {}, scroll() {}, scrollBy() {}, focus() {}, blur() {}, print() {},
     alert() {}, confirm: () => false, prompt: () => null, open: () => null, close() {},
     isSecureContext: loc.protocol === "https:",
   });
+  // Touch devices expose ontouch* handlers; their presence is the classic mobile check.
+  if (dev.touch && !ipad) for (const t of [G, document]) for (const e of ["touchstart", "touchend", "touchmove", "touchcancel"]) t[`on${e}`] = null;
   G.matchMedia = media => ({
     matches: false, media, onchange: null,
     addListener() {}, removeListener() {}, addEventListener() {}, removeEventListener() {},
@@ -278,7 +307,90 @@
   const E = L.Element.prototype;
   E.getBoundingClientRect ??= () => ({ x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0 });
   E.getClientRects ??= () => [];
-  for (const m of ["scrollIntoView", "focus", "blur", "click"]) E[m] ??= function () {};
+  for (const m of ["scrollIntoView", "focus", "blur"]) E[m] ??= function () {};
+
+  // --- forms & activation behaviour ----------------------------------------
+  // linkedom has no form semantics: checked isn't reflected, no .form / .elements /
+  // requestSubmit(), and click() runs no default action. Browsers do all of that.
+  // Patch the prototypes parsed elements really have (linkedom's exported classes are facades).
+  const proto = tag => Object.getPrototypeOf(document.createElement(tag));
+  const [InputP, SelectP, TextAreaP, ButtonP, FormP] = ["input", "select", "textarea", "button", "form"].map(proto);
+  const def = (p, k, d) => Object.defineProperty(p, k, { configurable: true, ...d });
+  def(InputP, "checked", { get() { return this.hasAttribute("checked"); }, set(v) { v ? this.setAttribute("checked", "") : this.removeAttribute("checked"); } });
+  const optionsOf = s => [...s.querySelectorAll("option")];
+  const optValue = o => o.getAttribute("value") ?? o.textContent;
+  def(SelectP, "selectedIndex", {
+    get() { const o = optionsOf(this), i = o.findIndex(x => x.hasAttribute("selected")); return i >= 0 ? i : o.length && !this.multiple ? 0 : -1; },
+    set(i) { optionsOf(this).forEach((o, j) => j === i ? o.setAttribute("selected", "") : o.removeAttribute("selected")); },
+  });
+  def(SelectP, "value", {
+    get() { const o = optionsOf(this)[this.selectedIndex]; return o ? optValue(o) : ""; },
+    set(v) { this.selectedIndex = optionsOf(this).findIndex(o => optValue(o) === String(v)); },
+  });
+  def(SelectP, "options", { get() { return optionsOf(this); } });
+  for (const p of [InputP, SelectP, TextAreaP, ButtonP]) def(p, "form", { get() { return this.closest("form"); } });
+  const controls = f => [...f.querySelectorAll("input, select, textarea, button")];
+  def(FormP, "elements", { get() { return controls(this); } });
+  // Successful controls -> name/value pairs (HTML "constructing the entry list").
+  const formEntries = (form, submitter) => {
+    const out = [];
+    for (const el of controls(form)) {
+      const name = el.getAttribute("name"), type = (el.getAttribute("type") || "").toLowerCase();
+      if (!name || el.hasAttribute("disabled") || el.localName === "button" || ["submit", "button", "image", "reset", "file"].includes(type)) continue;
+      if ((type === "checkbox" || type === "radio") && !el.checked) continue;
+      if (el.localName === "select") { for (const o of optionsOf(el).filter((o, i) => o.hasAttribute("selected") || (!el.multiple && i === el.selectedIndex))) out.push([name, optValue(o)]); continue; }
+      out.push([name, (type === "checkbox" || type === "radio") ? (el.getAttribute("value") ?? "on") : String(el.value ?? "")]);
+    }
+    if (submitter?.getAttribute("name")) out.push([submitter.getAttribute("name"), submitter.getAttribute("value") || ""]);
+    return out;
+  };
+  const submitForm = (form, submitter) => {
+    const attr = k => submitter?.getAttribute(`form${k}`) || form.getAttribute(k);
+    const method = (attr("method") || "get").toLowerCase();
+    const action = new URL(attr("action") || loc.href, loc);
+    const body = formEntries(form, submitter).map(kv => kv.map(encodeURIComponent).join("=")).join("&").replace(/%20/g, "+");
+    // ponytail: multipart forms are sent urlencoded and file inputs are skipped.
+    if (method === "post") requestNav(action.href, "POST", body, "application/x-www-form-urlencoded");
+    else { action.search = body; requestNav(action.href); }
+  };
+  class SubmitEvent extends L.Event {
+    constructor(type, init = {}) { super(type, init); this.submitter = init.submitter ?? null; }
+  }
+  G.SubmitEvent = SubmitEvent;
+  FormP.submit = function () { submitForm(this, null); }; // no submit event, like browsers
+  FormP.requestSubmit = function (submitter = null) {
+    if (this.dispatchEvent(new SubmitEvent("submit", { bubbles: true, cancelable: true, submitter }))) submitForm(this, submitter);
+  };
+  FormP.reset = function () {};
+  const fireInput = el => {
+    el.dispatchEvent(new L.Event("input", { bubbles: true }));
+    el.dispatchEvent(new L.Event("change", { bubbles: true }));
+  };
+  // click(): events first, then the default action unless a handler cancelled it.
+  const click = function () {
+    const type = (this.getAttribute?.("type") || "").toLowerCase(), toggles = this.localName === "input" && (type === "checkbox" || type === "radio");
+    const was = toggles ? this.checked : undefined;
+    if (toggles) {
+      if (type === "radio") for (const r of (this.form || document).querySelectorAll(`input[type=radio][name="${this.getAttribute("name")}"]`)) r.checked = false;
+      this.checked = type === "radio" ? true : !was;
+    }
+    const ok = this.dispatchEvent(new (G.MouseEvent || L.Event)("click", { bubbles: true, cancelable: true, detail: 1, button: 0 }));
+    if (toggles) { if (!ok) this.checked = was; else if (this.checked !== was) fireInput(this); return; }
+    if (!ok) return;
+    const a = this.closest?.("a[href], area[href]");
+    if (a) return requestNav(a.getAttribute("href"));
+    const btn = this.closest?.("button, input[type=submit], input[type=image]");
+    if (btn && !btn.hasAttribute("disabled")) {
+      const t = (btn.getAttribute("type") || "submit").toLowerCase();
+      if (t === "submit" || t === "image") btn.form?.requestSubmit(btn);
+      return;
+    }
+    const label = this.closest?.("label");
+    const target = label && (label.getAttribute("for") ? document.getElementById(label.getAttribute("for")) : label.querySelector("input, select, textarea"));
+    if (target && target !== this) target.click();
+  };
+  E.click = click;
+  proto("div").click = click;
 
   G.crypto = {
     getRandomValues(arr) {
@@ -370,11 +482,15 @@
     getEntries: () => [], getEntriesByType: () => [], getEntriesByName: () => [],
   };
 
+  // Timers run up to `horizon` virtual ms; actions push it forward (__ws_extend).
+  let horizon = cfg.maxVirtualMs;
+  G.__ws_extend = ms => { horizon = Math.max(horizon, now + ms); };
   // Runs the next due timer. Returns false when nothing is left within the virtual time budget.
   G.__ws_tick = () => {
+    if (G.__ws_nav) return false; // the document is being replaced
     let next = null;
     for (const [id, t] of timers) if (!next || t.at < next[1].at) next = [id, t];
-    if (!next || next[1].at > cfg.maxVirtualMs) return false;
+    if (!next || next[1].at > horizon) return false;
     const [id, t] = next;
     now = Math.max(now, t.at);
     if (t.every) t.at = now + t.every; else timers.delete(id);
@@ -386,12 +502,93 @@
     return true;
   };
 
+  // --- actions: scrape `actions`, run by Rust one at a time between event-loop turns ---
+  // Selectors are CSS, or "text=Sign in" for the clickable thing (else any element) with that text.
+  const find = sel => {
+    if (!sel.startsWith("text=")) return document.querySelector(sel);
+    const want = sel.slice(5).trim().toLowerCase();
+    const text = el => (el.localName === "input" ? el.getAttribute("value") || "" : el.textContent || "").trim().toLowerCase();
+    for (const pool of ["a, button, input[type=submit], input[type=button], label, summary, option, [role=button], [role=link], [role=tab], [onclick]", "*"]) {
+      const els = [...document.querySelectorAll(pool)];
+      const hit = els.find(el => text(el) === want)
+        || els.filter(el => text(el).includes(want)).sort((a, b) => text(a).length - text(b).length)[0];
+      if (hit) return hit;
+    }
+    return null;
+  };
+  const must = sel => { const el = find(String(sel)); if (!el) throw new Error(`no element matches ${sel}`); return el; };
+  // Frameworks (React...) shadow `value` on the instance; the prototype setter is what they observe.
+  const setValue = (el, v) => {
+    let p = Object.getPrototypeOf(el), d;
+    while (p && !(d = Object.getOwnPropertyDescriptor(p, "value"))) p = Object.getPrototypeOf(p);
+    d?.set ? d.set.call(el, v) : (el.value = v);
+  };
+  const key = (el, type, k) => el.dispatchEvent(new (G.KeyboardEvent || L.Event)(type,
+    { key: k, code: k.length === 1 ? `Key${k.toUpperCase()}` : k, bubbles: true, cancelable: true }));
+  let focused = null;
+  const focus = el => { focused = el; el.dispatchEvent(new L.Event("focus")); el.dispatchEvent(new L.Event("focusin", { bubbles: true })); };
+  const actions = {
+    click: a => { const el = must(a.click); focus(el); el.click(); },
+    type: a => {
+      const el = must(a.type);
+      focus(el);
+      if (a.clear !== false) setValue(el, "");
+      for (const ch of String(a.text ?? "")) {
+        if (!key(el, "keydown", ch)) continue;
+        key(el, "keypress", ch);
+        setValue(el, String(el.value ?? "") + ch);
+        el.dispatchEvent(new (G.InputEvent || L.Event)("input", { bubbles: true, data: ch, inputType: "insertText" }));
+        key(el, "keyup", ch);
+      }
+      el.dispatchEvent(new L.Event("change", { bubbles: true }));
+    },
+    select: a => {
+      const el = must(a.select);
+      el.value = String(a.value);
+      if (el.selectedIndex < 0) throw new Error(`no option with value ${a.value}`);
+      fireInput(el);
+    },
+    check: a => { const el = must(a.check); if (!el.checked) el.click(); },
+    uncheck: a => { const el = must(a.uncheck); if (el.checked) el.click(); },
+    submit: a => {
+      const el = must(a.submit), form = el.localName === "form" ? el : el.closest("form");
+      if (!form) throw new Error(`${a.submit} is not in a form`);
+      form.requestSubmit();
+    },
+    press: a => {
+      const el = a.selector ? must(a.selector) : focused || document.body, k = String(a.press);
+      const ok = key(el, "keydown", k);
+      if (k.length === 1) key(el, "keypress", k);
+      key(el, "keyup", k);
+      // Enter in a text field submits its form ("implicit submission").
+      const form = el.closest?.("form");
+      if (ok && k === "Enter" && form && el.localName === "input") form.requestSubmit(form.querySelector("button:not([type]), button[type=submit], input[type=submit]"));
+    },
+    goto: a => requestNav(String(a.goto)),
+    // ponytail: a returned Promise isn't awaited; read async results with a later eval.
+    eval: a => { const v = (0, eval)(String(a.eval)); return v instanceof Promise ? null : JSON.parse(JSON.stringify(v ?? null)); },
+    wait: a => G.__ws_extend(Number(a.wait) || 0),
+    wait_for: () => {}, // Rust runs the event loop until it matches
+  };
+  G.__ws_act = json => {
+    const a = JSON.parse(json);
+    const verb = Object.keys(actions).find(k => k in a);
+    if (!verb) return JSON.stringify({ ok: false, error: `unknown action; use one of ${Object.keys(actions).join(", ")}` });
+    try {
+      const value = actions[verb](a);
+      return JSON.stringify({ ok: true, ...(verb === "eval" && { value }) });
+    } catch (e) {
+      return JSON.stringify({ ok: false, error: String(e?.message ?? e) });
+    }
+  };
+  G.__ws_found = sel => { try { return !!find(sel); } catch { return false; } };
+
   // --- network: fetch / XHR -----------------------------------------------
-  const http = (method, url, headers, body) => JSON.parse(__ws_http(
+  // Rust adds the browser's own headers (sec-fetch-*, referer, origin...) per dest.
+  const http = (method, url, headers, body, dest = "empty") => JSON.parse(__ws_http(
     String(method || "GET").toUpperCase(), new URL(url, loc).href,
-    JSON.stringify(headers), body == null ? null : String(body),
+    JSON.stringify(headers), body == null ? null : String(body), dest,
   ));
-  const corsHeaders = { "sec-fetch-dest": "empty", "sec-fetch-mode": "cors", "sec-fetch-site": "same-origin" };
 
   class Headers {
     constructor(init) {
@@ -442,7 +639,7 @@
   G.fetch = (input, init = {}) => new Promise((resolve, reject) => {
     try {
       const req = new Request(input, init);
-      const r = http(req.method, req.url, { ...corsHeaders, ...Object.fromEntries(req.headers) }, req.body);
+      const r = http(req.method, req.url, Object.fromEntries(req.headers), req.body);
       resolve(new Response(r.body, { status: r.status, headers: r.headers, url: r.url }));
     } catch (e) {
       reject(new TypeError(`Failed to fetch: ${e.message}`));
@@ -466,7 +663,7 @@
       setTimeout(() => {
         let r;
         try {
-          r = http(this._m, this._u, { ...corsHeaders, ...this._h }, body);
+          r = http(this._m, this._u, this._h, body);
         } catch (e) {
           __ws_log("warn", `xhr ${this._u}: ${e.message}`);
         }
@@ -531,7 +728,7 @@
     if (src) {
       const url = new URL(src, loc).href;
       try {
-        const r = http("GET", url, { "sec-fetch-dest": "script", "sec-fetch-mode": "no-cors" }, null);
+        const r = http("GET", url, {}, null, "script");
         if (r.status >= 400) throw new Error(`HTTP ${r.status}`);
         code = r.body;
       } catch (e) {

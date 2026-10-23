@@ -2,6 +2,7 @@ pub mod client;
 pub mod response;
 pub mod detect;
 pub mod cache;
+pub mod headers;
 
 pub use client::HttpClient;
 pub use response::HttpResponse;

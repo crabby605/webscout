@@ -20,6 +20,7 @@ use url::Url;
 
 use crate::error::{Result, ScoutError};
 use crate::http::{HttpClient, HttpResponse};
+use crate::http::headers::Dest;
 use crate::identity::Identity;
 
 const DOM_BUNDLE: &str = include_str!("../vendor/dom-bundle.js");
@@ -35,7 +36,26 @@ pub struct Rendered {
     pub console: Vec<String>,
     /// True if the wall-clock budget ran out before the page went idle.
     pub timed_out: bool,
+    /// One `{ok, error?, value?}` per action that ran, in order.
+    pub results: Vec<serde_json::Value>,
+    /// The document asked to be replaced (link, form submit, location.href = ...).
+    pub nav: Option<Nav>,
 }
+
+/// A navigation requested by the page, for the caller to load as the next document.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Nav {
+    pub url: String,
+    pub method: String,
+    pub body: Option<String>,
+    pub content_type: Option<String>,
+}
+
+/// Virtual time a page gets to react after each action (debounces, animations, fetches).
+const SETTLE_MS: u64 = 2000;
+/// Default virtual time a `wait_for` action waits for its selector.
+const WAIT_FOR_MS: u64 = 10_000;
 
 pub struct Page<'a> {
     pub html: &'a str,
@@ -44,6 +64,8 @@ pub struct Page<'a> {
     pub client: HttpClient,
     pub cookies: Arc<RwLock<CookieStore>>,
     pub timeout: Duration,
+    /// Interactions to perform once the page is idle (see __ws_act in js_prelude.js).
+    pub actions: &'a [serde_json::Value],
 }
 
 /// Blocking HTTP for page JS, bounded by the render deadline.
@@ -52,13 +74,16 @@ struct Net {
     client: HttpClient,
     handle: Handle,
     deadline: Instant,
+    /// The current document's URL: referrer / origin of everything it loads.
+    page_url: Rc<RefCell<String>>,
 }
 
 impl Net {
-    fn request(&self, method: &str, url: &str, headers: &[(String, String)], body: Option<String>) -> std::result::Result<HttpResponse, String> {
+    fn request(&self, method: &str, url: &str, dest: Dest, headers: &[(String, String)], body: Option<String>) -> std::result::Result<HttpResponse, String> {
         let remaining = self.deadline.saturating_duration_since(Instant::now());
+        let referrer = self.page_url.borrow().clone();
         self.handle.block_on(async {
-            tokio::time::timeout(remaining, self.client.request(method, url, headers, body)).await
+            tokio::time::timeout(remaining, self.client.request(method, url, dest, Some(&referrer), headers, body)).await
         })
         .map_err(|_| "timed out".to_string())?
         .map_err(|e| e.to_string())
@@ -81,8 +106,7 @@ struct NetLoader(Net);
 
 impl Loader for NetLoader {
     fn load<'js>(&mut self, ctx: &Ctx<'js>, name: &str, attrs: Option<ImportAttributes<'js>>) -> rquickjs::Result<Module<'js, Declared>> {
-        let headers = [("sec-fetch-dest".to_string(), "script".to_string()), ("sec-fetch-mode".to_string(), "cors".to_string())];
-        let r = self.0.request("GET", name, &headers, None)
+        let r = self.0.request("GET", name, Dest::Module, &[], None)
             .map_err(|e| rquickjs::Error::new_loading_message(name, e))?;
         if r.status >= 400 {
             return Err(rquickjs::Error::new_loading_message(name, format!("HTTP {}", r.status)));
@@ -103,7 +127,7 @@ pub fn render(page: Page) -> Result<Rendered> {
     let deadline = Instant::now() + page.timeout;
     let rt = Runtime::new().map_err(js_err)?;
     rt.set_memory_limit(MEMORY_LIMIT);
-    let net = Net { client: page.client.clone(), handle: Handle::current(), deadline };
+    let net = Net { client: page.client.clone(), handle: Handle::current(), deadline, page_url: Rc::new(RefCell::new(page.url.to_string())) };
     rt.set_loader(UrlResolver, NetLoader(net.clone()));
     // Kill runaway scripts (infinite loops) once the budget is spent.
     rt.set_interrupt_handler(Some(Box::new(move || Instant::now() > deadline)));
@@ -124,9 +148,9 @@ pub fn render(page: Page) -> Result<Rendered> {
             "url": page.url,
             "userAgent": page.identity.user_agent,
             "secChUa": page.identity.sec_ch_ua,
-            "platform": page.identity.platform,
+            "browser": page.identity.browser,
+            "device": page.identity.device,
             "languages": languages,
-            "viewport": page.identity.viewport,
             "maxVirtualMs": page.timeout.as_millis() as u64,
         });
         let config = ctx.json_parse(config.to_string()).map_err(js_err)?;
@@ -137,36 +161,71 @@ pub fn render(page: Page) -> Result<Rendered> {
         Ok(())
     })?;
 
-    // Event loop: drain promise jobs, then run the next timer task, until idle or out of time.
-    let mut timed_out = false;
-    loop {
-        while rt.is_job_pending() {
-            if let Err(e) = rt.execute_pending_job() {
-                let msg = e.0.with(|ctx| format!("{:?}", ctx.catch()));
-                push_log(&logs, "error", &format!("unhandled job: {msg}"));
-            }
-        }
-        if Instant::now() > deadline {
-            timed_out = true;
+    let mut timed_out = run_loop(&rt, &ctx, &logs, deadline, None).0;
+    let mut nav = take_nav(&ctx);
+    let mut results = Vec::new();
+    for action in page.actions {
+        if nav.is_some() || timed_out {
             break;
         }
-        let more = ctx.with(|ctx| ctx.eval::<bool, _>("__ws_tick()").catch(&ctx).map_err(|e| e.to_string()));
-        match more {
-            Ok(true) => continue,
-            Ok(false) => break,
-            Err(e) => {
-                // Interrupted by the deadline, or the tick itself threw.
-                push_log(&logs, "error", &e);
-                timed_out = Instant::now() > deadline;
-                break;
-            }
+        let r = ctx.with(|ctx| -> rquickjs::Result<String> {
+            ctx.globals().get::<_, Function>("__ws_act")?.call((action.to_string(),))
+        });
+        let mut r: serde_json::Value = r.ok().and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_else(|| json!({ "ok": false, "error": "action crashed" }));
+        let wait_for = action.get("wait_for").and_then(|v| v.as_str());
+        let budget = if wait_for.is_some() { action.get("timeout").and_then(|v| v.as_u64()).unwrap_or(WAIT_FOR_MS) } else { SETTLE_MS };
+        let _ = ctx.with(|ctx| ctx.eval::<(), _>(format!("__ws_extend({budget})")));
+        let (t, found) = run_loop(&rt, &ctx, &logs, deadline, wait_for);
+        timed_out = t;
+        if let (Some(sel), false) = (wait_for, found) {
+            r = json!({ "ok": false, "error": format!("nothing matched {sel} in time") });
         }
+        results.push(r);
+        nav = take_nav(&ctx);
     }
 
     rt.set_interrupt_handler(None);
     let html = ctx.with(|ctx| ctx.eval::<String, _>("__ws_serialize()").catch(&ctx).map_err(js_err))?;
     let console = logs.borrow().clone();
-    Ok(Rendered { html, console, timed_out })
+    Ok(Rendered { html, console, timed_out, results, nav })
+}
+
+fn take_nav(ctx: &Context) -> Option<Nav> {
+    let s = ctx.with(|ctx| ctx.eval::<Option<String>, _>("__ws_nav && JSON.stringify(__ws_nav)").ok().flatten())?;
+    serde_json::from_str(&s).ok()
+}
+
+/// Drains promise jobs and runs timer tasks until the page is idle (or `until` matches,
+/// or time runs out). Returns (timed_out, until_matched).
+fn run_loop(rt: &Runtime, ctx: &Context, logs: &RefCell<Vec<String>>, deadline: Instant, until: Option<&str>) -> (bool, bool) {
+    let found = |ctx: &Context| until.is_some_and(|sel| ctx.with(|ctx| {
+        ctx.globals().get::<_, Function>("__ws_found").and_then(|f| f.call::<_, bool>((sel,))).unwrap_or(false)
+    }));
+    loop {
+        while rt.is_job_pending() {
+            if let Err(e) = rt.execute_pending_job() {
+                let msg = e.0.with(|ctx| format!("{:?}", ctx.catch()));
+                push_log(logs, "error", &format!("unhandled job: {msg}"));
+            }
+        }
+        if found(ctx) {
+            return (false, true);
+        }
+        if Instant::now() > deadline {
+            return (true, false);
+        }
+        let more = ctx.with(|ctx| ctx.eval::<bool, _>("__ws_tick()").catch(&ctx).map_err(|e| e.to_string()));
+        match more {
+            Ok(true) => continue,
+            Ok(false) => return (false, found(ctx)),
+            Err(e) => {
+                // Interrupted by the deadline, or the tick itself threw.
+                push_log(logs, "error", &e);
+                return (Instant::now() > deadline, false);
+            }
+        }
+    }
 }
 
 fn push_log(logs: &RefCell<Vec<String>>, level: &str, msg: &str) {
@@ -194,13 +253,15 @@ fn install_host_fns<'js>(
         ctx.eval_with_options::<(), _>(code, opts)
     })?)?;
 
-    g.set("__ws_http", Function::new(ctx.clone(), move |ctx: Ctx<'js>, method: String, url: String, headers: String, body: Option<String>| {
+    // dest: "empty" (fetch/XHR) or "script" (classic <script src>).
+    g.set("__ws_http", Function::new(ctx.clone(), move |ctx: Ctx<'js>, method: String, url: String, headers: String, body: Option<String>, dest: String| {
         let headers: Vec<(String, String)> = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&headers)
             .unwrap_or_default()
             .into_iter()
             .map(|(k, v)| (k, v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())))
             .collect();
-        match net.request(&method, &url, &headers, body) {
+        let dest = if dest == "script" { Dest::Script } else { Dest::Empty };
+        match net.request(&method, &url, dest, &headers, body) {
             Ok(r) => {
                 let hdrs: Vec<(&str, &str)> = r.headers.iter()
                     .filter_map(|(k, v)| Some((k.as_str(), v.to_str().ok()?)))
@@ -265,14 +326,52 @@ mod tests {
     use crate::session::Session;
 
     async fn run(html: &'static str, timeout_ms: u64) -> Rendered {
+        run_actions(html, timeout_ms, serde_json::json!([])).await
+    }
+
+    async fn run_actions(html: &'static str, timeout_ms: u64, actions: serde_json::Value) -> Rendered {
         let session = Session::new();
         let client = HttpClient::build(&session).unwrap();
         let identity = session.identity.clone();
         let cookies = Arc::clone(&session.cookies);
+        let actions = actions.as_array().unwrap().clone();
         tokio::task::spawn_blocking(move || render(Page {
             html, url: "https://ex.com/a/b?q=1", identity: &identity, client, cookies,
-            timeout: Duration::from_millis(timeout_ms),
+            timeout: Duration::from_millis(timeout_ms), actions: &actions,
         })).await.unwrap().unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn actions_drive_the_page() {
+        let html = r#"<html><body>
+            <input id=q><span id=echo></span><label><input type=checkbox id=c name=c> c</label>
+            <select id=s name=s><option value=a>A</option><option value=b>B</option></select>
+            <button id=later>later</button><div id=slot></div>
+            <form id=f method=post action="/login"><input name=user id=user><button id=go>Sign in</button></form>
+            <script>
+              const $ = id => document.getElementById(id);
+              $('q').addEventListener('input', () => $('echo').textContent = $('q').value);
+              $('later').onclick = () => setTimeout(() => $('slot').innerHTML = '<b id=late>ok</b>', 1500);
+            </script></body></html>"#;
+        let r = run_actions(html, 5000, serde_json::json!([
+            {"type": "#q", "text": "hello"},
+            {"check": "#c"},
+            {"select": "#s", "value": "b"},
+            {"click": "#later"},
+            {"wait_for": "#late"},
+            {"eval": "['echo', 'c', 's'].map(id => document.getElementById(id)).map((e, i) => [e.textContent, e.checked, e.value][i])"},
+            {"click": "#nope"},
+            {"type": "#user", "text": "ann lee"},
+            {"click": "text=Sign in"},
+            {"eval": "'never runs: the form navigated away'"},
+        ])).await;
+        let ok: Vec<bool> = r.results.iter().map(|v| v["ok"].as_bool().unwrap()).collect();
+        assert_eq!(ok, [true, true, true, true, true, true, false, true, true], "{:?}", r.results);
+        assert_eq!(r.results[5]["value"], serde_json::json!(["hello", true, "b"]));
+        let nav = r.nav.expect("form submit navigates");
+        assert_eq!((nav.method.as_str(), nav.url.as_str()), ("POST", "https://ex.com/login"));
+        assert_eq!(nav.body.as_deref(), Some("user=ann+lee"));
+        assert!(r.html.contains(r#"id="c" name="c" checked"#) || r.html.contains("checked"), "checked state is serialized");
     }
 
     #[tokio::test(flavor = "multi_thread")]

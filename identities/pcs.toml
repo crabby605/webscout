@@ -1,0 +1,154 @@
+# Desktop and laptop identities. ~/.webscout/identities/*.toml is what webscout loads;
+# it's seeded from these files on first run, so edit/add/remove devices there.
+#
+# name        unique id, also matched by identity specs ("macbook", "rtx")
+# kind        desktop | phone | tablet
+# os          windows | macos | linux | android | ios
+# os_version  what UA client hints report as platformVersion
+# browsers    picked at random; repeat an entry to weight it
+# screen      CSS pixels [width, height]; dpr = device pixel ratio
+# cpu_cores   navigator.hardwareConcurrency (logical cores)
+# ram_gb      real RAM; Chromium reports navigator.deviceMemory capped at 8
+# gpu         the unmasked WebGL vendor/renderer *Chrome* reports on this machine
+#             (Firefox and Safari variants are derived from it)
+# arch        x86 | arm (UA client hints)
+
+[[device]]
+name = "win-desktop-rtx3060"
+kind = "desktop"
+vendor = "Custom"
+os = "windows"
+os_version = "15.0.0"
+browsers = ["chrome", "chrome", "chrome", "edge", "firefox", "opera", "brave"]
+screen = [1920, 1080]
+dpr = 1.0
+cpu_cores = 12
+ram_gb = 16
+arch = "x86"
+gpu = { vendor = "Google Inc. (NVIDIA)", renderer = "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 (0x00002504) Direct3D11 vs_5_0 ps_5_0, D3D11)" }
+
+[[device]]
+name = "win-gaming-rtx4070"
+kind = "desktop"
+vendor = "Custom"
+os = "windows"
+os_version = "19.0.0"
+browsers = ["chrome", "chrome", "edge", "firefox", "opera", "brave"]
+screen = [2560, 1440]
+dpr = 1.0
+cpu_cores = 16
+ram_gb = 32
+arch = "x86"
+gpu = { vendor = "Google Inc. (NVIDIA)", renderer = "ANGLE (NVIDIA, NVIDIA GeForce RTX 4070 (0x00002786) Direct3D11 vs_5_0 ps_5_0, D3D11)" }
+
+[[device]]
+name = "win-office-uhd630"
+kind = "desktop"
+vendor = "Dell"
+os = "windows"
+os_version = "10.0.0"
+browsers = ["chrome", "chrome", "edge", "edge", "firefox"]
+screen = [1920, 1080]
+dpr = 1.0
+cpu_cores = 12
+ram_gb = 16
+arch = "x86"
+gpu = { vendor = "Google Inc. (Intel)", renderer = "ANGLE (Intel, Intel(R) UHD Graphics 630 (0x00003E92) Direct3D11 vs_5_0 ps_5_0, D3D11)" }
+
+[[device]]
+name = "win-laptop-irisxe"
+kind = "desktop"
+vendor = "Lenovo"
+os = "windows"
+os_version = "15.0.0"
+browsers = ["chrome", "chrome", "edge", "firefox", "brave"]
+screen = [1536, 864]
+dpr = 1.25
+cpu_cores = 8
+ram_gb = 16
+arch = "x86"
+gpu = { vendor = "Google Inc. (Intel)", renderer = "ANGLE (Intel, Intel(R) Iris(R) Xe Graphics (0x00009A49) Direct3D11 vs_5_0 ps_5_0, D3D11)" }
+
+[[device]]
+name = "win-laptop-radeon780m"
+kind = "desktop"
+vendor = "ASUS"
+os = "windows"
+os_version = "19.0.0"
+browsers = ["chrome", "chrome", "edge", "firefox", "opera"]
+screen = [1536, 864]
+dpr = 1.25
+cpu_cores = 16
+ram_gb = 16
+arch = "x86"
+gpu = { vendor = "Google Inc. (AMD)", renderer = "ANGLE (AMD, AMD Radeon 780M Graphics (0x000015BF) Direct3D11 vs_5_0 ps_5_0, D3D11)" }
+
+[[device]]
+name = "macbook-air-m2"
+kind = "desktop"
+vendor = "Apple"
+os = "macos"
+os_version = "15.6.0"
+browsers = ["safari", "safari", "chrome", "chrome", "brave", "firefox", "edge", "opera"]
+screen = [1470, 956]
+dpr = 2.0
+cpu_cores = 8
+ram_gb = 8
+arch = "arm"
+gpu = { vendor = "Google Inc. (Apple)", renderer = "ANGLE (Apple, ANGLE Metal Renderer: Apple M2, Unspecified Version)" }
+
+[[device]]
+name = "macbook-pro-m3pro"
+kind = "desktop"
+vendor = "Apple"
+os = "macos"
+os_version = "26.0.0"
+browsers = ["safari", "safari", "chrome", "chrome", "brave", "firefox", "edge"]
+screen = [1512, 982]
+dpr = 2.0
+cpu_cores = 12
+ram_gb = 18
+arch = "arm"
+gpu = { vendor = "Google Inc. (Apple)", renderer = "ANGLE (Apple, ANGLE Metal Renderer: Apple M3 Pro, Unspecified Version)" }
+
+[[device]]
+name = "imac-m3"
+kind = "desktop"
+vendor = "Apple"
+os = "macos"
+os_version = "15.6.0"
+browsers = ["safari", "safari", "chrome", "firefox"]
+screen = [2240, 1260]
+dpr = 2.0
+cpu_cores = 8
+ram_gb = 16
+arch = "arm"
+gpu = { vendor = "Google Inc. (Apple)", renderer = "ANGLE (Apple, ANGLE Metal Renderer: Apple M3, Unspecified Version)" }
+
+[[device]]
+name = "linux-desktop-intel"
+kind = "desktop"
+vendor = "Custom"
+os = "linux"
+os_version = "6.8.0"
+browsers = ["chrome", "chrome", "firefox", "firefox", "brave"]
+screen = [1920, 1080]
+dpr = 1.0
+cpu_cores = 8
+ram_gb = 16
+arch = "x86"
+gpu = { vendor = "Google Inc. (Intel)", renderer = "ANGLE (Intel, Mesa Intel(R) UHD Graphics 620 (KBL GT2), OpenGL 4.6)" }
+
+[[device]]
+name = "linux-desktop-amd"
+kind = "desktop"
+vendor = "Custom"
+os = "linux"
+os_version = "6.11.0"
+browsers = ["chrome", "firefox", "firefox", "brave"]
+screen = [2560, 1440]
+dpr = 1.0
+cpu_cores = 16
+ram_gb = 32
+arch = "x86"
+gpu = { vendor = "Google Inc. (AMD)", renderer = "ANGLE (AMD, AMD Radeon RX 6700 XT (radeonsi navi22 LLVM 17.0.6), OpenGL 4.6)" }

@@ -1,144 +1,116 @@
 # WebScout
 
-Custom headless browser engine for LLMs. No Chromium, no Playwright dependency.
-Built to look indistinguishable from real browsers (Chrome/Firefox/Safari) at the TLS and HTTP/2 network levels.
+Headless browser engine for LLMs and scraping runners. No Chromium needed for normal
+browsing: it looks like a real Chrome / Edge / Opera / Brave / Firefox / Safari on a real
+desktop, phone or tablet at the TLS, HTTP/2, header and JavaScript layers. When a site
+still wants a human (captcha, bot wall, login), it hands off to a real Chrome and takes
+over that browser's cookies and fingerprint afterwards.
 
-## Running Output
+## CLI
 ```bash
-cargo run -- --url "https://nowsecure.nl"
-
-# Query the DOM (CSS selectors), page text, links
-webscout -u https://news.ycombinator.com -s '.titleline > a'
-webscout -u https://example.com --text
-webscout -u https://example.com --links
-
-# Run the page's JavaScript first (client-rendered / SPA pages)
+webscout -u https://news.ycombinator.com -s '.titleline > a'   # CSS selector
+webscout -u https://example.com --text                          # visible text (or raw body for non-HTML)
 webscout -u https://quotes.toscrape.com/js/ --js -s '.quote .text'
+webscout -u https://example.com --identity "phone samsung" --text
+webscout -u https://site.test --actions '[{"type":"#q","text":"boots"},{"press":"Enter"}]' --text
+webscout -u https://site.test --proxy socks5://user:pass@host:1080 --text
 
-# HTTP/JSON daemon used by the MCP server (mcp/webscout_mcp.py)
-webscout serve --port 8080
+webscout serve --port 8080            # HTTP/JSON daemon (what the MCP server and runners talk to)
 webscout session show mcp
 ```
 
-## JavaScript DOM
-`--js` (or `"js": true` over the API) runs page scripts in QuickJS against a full DOM:
-[linkedom](https://github.com/WebReflection/linkedom), bundled with core-js polyfills into
-`vendor/dom-bundle.js` (rebuild: `cd vendor && bun install && bun run build`).
-`src/js_prelude.js` and `src/js_webapis.js` supply the browser environment around it.
+## Identities
+`identities/{pcs,phones,tablets}.toml` are copied to `~/.webscout/identities/` on first use;
+edit, add or delete devices there (screen, DPR, CPU cores, RAM, GPU, touch, model, OS
+version, and which browsers it runs, repeat one to weight it). Field docs are at the top of
+`pcs.toml`. Pick one with a spec: words that must match a device's name, vendor, kind
+(`desktop`/`pc`, `phone`/`mobile`, `tablet`) or OS, plus optionally a browser:
+`"iphone"`, `"phone samsung"`, `"tablet android"`, `"windows edge"`, `"linux firefox"`, `"iqoo-13 brave"`.
+Without one, a session is a desktop running the host's OS (`WEBSCOUT_IDENTITY` overrides),
+since the TCP/IP fingerprint always comes from the real host.
 
-- Classic + ES module scripts (imports fetched through the session, JSON imports, dynamic `import()`), dynamically inserted scripts, `document.write`
-- `fetch`, `XMLHttpRequest`, `document.cookie` over the session's identity and cookie jar
-- Timers on a virtual clock (a 3s `setTimeout` runs immediately), promises, `DOMContentLoaded`/`load`
-- `URL`, `crypto`, `AbortController`, `Blob`/`FormData`, `MessageChannel`, en-US `Intl`, no-op canvas 2D, storage
-- Not supported: layout (sizes are 0), WebAssembly, WebGL, WebSocket/Worker (they fail cleanly), IndexedDB
-- Each run is capped by `--js-timeout` (default 5000ms) and a 256MB heap
+Per identity, consistently: TLS + HTTP/2 fingerprint (wreq/BoringSSL), the browser's exact
+header set and order for each kind of request (navigation, `fetch`/XHR, scripts) with
+correct `sec-fetch-*` / referer / origin, current versions (Chrome/Firefox auto-bump every
+4 weeks), and the JS environment (navigator, client hints, screen, touch, media queries, WebGL GPU).
 
-## Directory Structure
-```text
-src/
-├── main.rs           # CLI entry
-├── error.rs          # unified error type
-├── identity.rs       # UA pool, header order, TLS fingerprint
-├── session.rs        # per-session cookie jar + identity
-└── http/             # HTTP client with identity headers / evasions
-    ├── client.rs       
-    ├── cache.rs
-    ├── detect.rs     # Anti-bot detection routines
-    └── response.rs
-```
+## HTTP API (`webscout serve`)
+Every request may name a `session` (identity + cookie jar, persisted in `~/.webscout/sessions/`).
+`identity`, `proxy` and `forwarded_for` apply when that request creates the session; asking an
+existing session to be something else is an error rather than silently browsing as the wrong device.
 
-## Phase 1 Readiness (Currently Implemented)
-- **Strict Identity Simulation:** Generates fully coherent user-agent, `sec-ch-ua` headers, viewports, platforms, and strictly orders the transmitted HTTP headers.
-- **TLS Parameter Tuning:** Reorders `ClientConfig` cipher suites to properly mock Chrome's AES128 precedence natively via `rustls`.
-- **HTTP/2 Evasion Tuning:** Spoofs Akamai `INITIAL_WINDOW_SIZE` (6,291,456 bytes) and corresponding HTTP/2 connection updates dynamically via `reqwest` builder extensions. 
-- **Persisted Sessions:** Full robust cookie jar generation and isolated session store `UUID` persistence tracking.
-- **Passive Bot Bypass:** Out-of-the-box native bypass for passive Cloudflare configurations (no bot challenges triggered on standard fetches like `nowsecure.nl`).
-- **Response State Machine:** Automatically classifies blocked patterns to halt requests when interacting with traps (Rate Limit, CF challenge, HCaptcha, JS checks, etc).
-
-## Stack (Currently Implemented)
-| Component | Crate |
-| --- | --- |
-| Async | tokio |
-| HTTP | reqwest + hyper |
-| TLS Evasion | rustls |
-| CLI / Logging | clap + tracing |
-| Cookie Management | cookie_store |
-
----
-
-## Future Architecture (Phase 2 & Beyond Planned)
-┌─────────────────────────────────────────┐
-│           Transport Layer               │
-│   MCP (stdio/JSON-RPC) │ REST (axum)    │
-└────────────────┬────────────────────────┘
-                 │
-┌────────────────▼────────────────────────┐
-│              Engine Core                │
-│  Identity → HTTP → HTML → JS → Extract │
-└─────────────────────────────────────────┘
-
-### Planned Stack Additions
-| Component | Crate |
-| --- | --- |
-| HTML parser | html5ever + scraper |
-| JS runtime | rquickjs (QuickJS) |
-| Renderer | tiny-skia |
-| REST | axum |
-| MCP | JSON-RPC stdio |
-
-### Future Setup & Running Tools (Currently Unavailable)
-```bash
-# install just
-cargo install just
-
-# copy config
-just init-config
-# edit config.toml
-
-# install dev tools
-just setup
-```
-
-## Future REST API (Planned)
 `POST /scrape`
 ```json
 {
-  "url": "https://example.com",
-  "format": "markdown",   // markdown | raw | json | screenshot
+  "url": "https://example.com", "session": "shop", "format": "markdown",
+  "identity": "phone samsung", "proxy": "http://user:pass@host:8080",
   "js": true,
-  "session_id": "..."     // optional, omit for new session
+  "actions": [
+    {"type": "input[name=q]", "text": "red shoes"}, {"press": "Enter"},
+    {"wait_for": ".results li", "timeout": 10000},
+    {"click": "text=Next"}, {"select": "#size", "value": "m"}, {"check": "#agree"},
+    {"submit": "form#checkout"}, {"wait": 1500}, {"goto": "/cart"},
+    {"eval": "document.querySelectorAll('.item').length"}
+  ]
 }
 ```
-- `POST /session/new` -> `{ session_id, user_agent }`
-- `POST /session/delete` -> `{ ok }`
-- `POST /session/cookies` -> `{ ok, cookies }`
-- `GET  /health` -> `{ status }`
+Actions run one at a time (selectors: CSS or `text=...`), and the navigations they cause
+(links, form submits, JS redirects) are followed like a browser tab. Results per action come
+back in `js.actions`. Blocked pages carry a `hint` pointing at the handoff.
 
-### Future MCP Tools (Planned)
-| Tool | Description |
-| --- | --- |
-| `scrape` | Fetch URL, return content in chosen format |
-| `screenshot` | Fetch URL, return base64 PNG |
-| `extract_links` | Return all links from URL |
-| `extract_forms` | Return all forms + fields |
-| `submit_form` | Submit form with field values |
-| `session_new` | Create session with fresh identity |
-| `session_delete` | Delete session |
+`/extract/links`, `/extract/forms`, `/extract/metadata` take the same body. `/cookies/import`
+takes `{url, header, session}`.
 
-### Future Challenge Solving (Planned)
-Supports: Cloudflare Turnstile, hCaptcha, reCAPTCHA v2/v3 via `config.toml` solving:
-```toml
-[challenge]
-enabled = true
-provider = "2captcha"    # or "capmonster"
-api_key = "your_key"
+### Human handoff
+```bash
+curl -X POST localhost:8080/handoff -d '{"url":"https://site.test","session":"shop","until_cookie":"cf_clearance"}' \
+     -H 'content-type: application/json'
+# -> {id, status, view_url, status_url, done_url, ...}
+```
+A real Chrome (own profile per session, same proxy) opens the URL. On a desktop the window
+appears; on a headless machine (or `"headless": true`) open `view_url` from any browser:
+it streams the page and forwards clicks, typing and scrolling. Finish with `POST done_url`,
+or let `until_cookie` / `until_url` finish it automatically; poll `status_url` meanwhile.
+The session then holds Chrome's cookies and is pinned to that Chrome's exact UA, client
+hints, screen, GPU and languages, so the site keeps seeing the browser it cleared.
+Set `WEBSCOUT_PUBLIC_URL` if humans reach the daemon under another address, `WEBSCOUT_CHROME`
+for a non-standard Chrome path. Bind the daemon to a public interface only on a trusted
+network: whoever reaches it can drive its sessions.
+
+### IP
+`proxy` (http/https/socks5) changes the address sites see. `forwarded_for` (an IP or
+`"random"`) only adds `X-Forwarded-For`/`X-Real-IP`; it fools servers that trust those
+headers, and bot walls treat it as a bot signal.
+
+## MCP
+`mcp/webscout_mcp.py` (stdio) starts the daemon and exposes `scrape` (with actions and
+identities), `handoff`, `handoff_status` (with a live frame), `handoff_done`,
+`extract_links|forms|metadata`, `import_cookies`, `session_info`, `session_clear`.
+
+## JavaScript
+Page scripts run in QuickJS against [linkedom](https://github.com/WebReflection/linkedom)
+(`vendor/dom-bundle.js`, rebuild: `cd vendor && bun install && bun run build`), with
+`src/js_prelude.js` and `src/js_webapis.js` supplying the browser around it: classic + module
+scripts, `fetch`/XHR/cookies through the session, a virtual clock for timers, forms with real
+submit semantics. Not supported: layout (sizes are 0), WebAssembly, `crypto.subtle`,
+WebSocket/Worker, IndexedDB; challenges that need them (e.g. AWS WAF) go to the handoff.
+
+## Development
+```bash
+cargo test --release
+python3 dev/testsite.py 8787   # local site: ordered header echo, forms, JS app, fake bot wall
 ```
 
-## Internal Engine TODOs
-- [ ] Full fontdue text rendering in tiny-skia renderer
-- [ ] submit_form tool implementation
-- [ ] TLS JA3/JA4 fingerprint via pseudo BoringSSL FFI integration
-- [ ] HTTP/2 HPACK header order spoofing natively via hyper
-- [ ] CSS visibility evaluation
-- [ ] file upload in form submit
-- [ ] WebSocket support
+## Layout
+```text
+identities/        device catalog (TOML)
+src/main.rs        CLI, browse loop (JS + actions + navigations)
+src/serve.rs       HTTP API
+src/handoff.rs     real-Chrome handoff over CDP + viewer page
+src/identity.rs    device/browser identities, version upkeep
+src/session.rs     named sessions on disk
+src/js.rs          QuickJS runtime, event loop, actions
+src/http/          wreq client, per-request browser headers, challenge detection
+mcp/               MCP server
+dev/testsite.py    local test site
+```

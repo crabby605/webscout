@@ -186,13 +186,13 @@ class EngineError(Exception):
     pass
 
 
-def _post_json(path: str, body: dict, want_bytes: bool = False):
+def _post_json(path: str, body, want_bytes: bool = False):
+    """POST `body` as JSON (GET when body is None) to the daemon."""
     base = DAEMON.ensure_running()
-    data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
         base + path,
-        data=data,
-        method="POST",
+        data=None if body is None else json.dumps(body).encode("utf-8"),
+        method="GET" if body is None else "POST",
         headers={"content-type": "application/json"},
     )
     try:
@@ -217,6 +217,10 @@ def _post_json(path: str, body: dict, want_bytes: bool = False):
     return payload.decode("utf-8"), ctype
 
 
+def _get_json(path: str):
+    return _post_json(path, None)
+
+
 def _with_session(body: dict, args: dict) -> dict:
     """Inject a session name if the caller didn't specify one. This is the
     knob that makes the MCP behave like one continuous browser."""
@@ -224,8 +228,12 @@ def _with_session(body: dict, args: dict) -> dict:
     body["session"] = sess
     if "strategy" in args and args["strategy"]:
         body["strategy"] = args["strategy"]
-    if args.get("mobile"):
-        body["mobile"] = True
+    # Only used when this call creates the session; the daemon refuses a mismatch.
+    for k in ("identity", "proxy", "forwarded_for"):
+        if args.get(k):
+            body[k] = args[k]
+    if args.get("mobile") and not args.get("identity"):
+        body["identity"] = "phone"
     return body
 
 
@@ -243,9 +251,14 @@ TOOLS = [
             "one continuous visitor. Use format 'markdown' for reading text, "
             "'json' for structured data, 'raw' for full HTML. Set js=true "
             "for SPA / client-rendered pages. strategy: plain | js | stealth. "
-            "Set mobile=true for a phone identity. Set render=true to ALSO get "
-            "a rendered PNG of the page back alongside the text, so you can see "
-            "what it looks like."
+            "actions drive the page like a user (implies js) and follow the "
+            "navigations they cause: [{\"type\": sel, \"text\": \"...\"}, "
+            "{\"click\": sel}, {\"select\": sel, \"value\": v}, {\"check\": sel}, "
+            "{\"uncheck\": sel}, {\"submit\": sel}, {\"press\": \"Enter\"}, "
+            "{\"wait\": ms}, {\"wait_for\": sel, \"timeout\": ms}, {\"goto\": url}, "
+            "{\"eval\": \"js expression\"}]. Selectors are CSS or 'text=Sign in'. "
+            "Results come back per action in js.actions. If the page is a bot "
+            "wall/captcha (state Blocked/Challenge), use the handoff tool."
         ),
         "inputSchema": {
             "type": "object",
@@ -254,52 +267,56 @@ TOOLS = [
                 "format": {"type": "string", "enum": ["json", "markdown", "raw"], "default": "json"},
                 "js": {"type": "boolean", "default": False},
                 "js_timeout_ms": {"type": "integer", "default": 5000},
+                "actions": {"type": "array", "items": {"type": "object"},
+                             "description": "Interactions to run in order; see the tool description."},
                 "delay": {"type": "string", "description": "Random delay range ms, e.g. '100-500'."},
                 "strategy": {"type": "string", "enum": ["plain", "js", "stealth"],
                               "description": "plain/js/stealth — stealth adds random delay + retry."},
                 "session": {"type": "string",
-                             "description": f"Named session (default '{DEFAULT_SESSION}'). Pass a different name to use a separate identity + cookie jar."},
+                             "description": f"Named session (default '{DEFAULT_SESSION}'). Each session is one browser: identity + cookie jar."},
+                "identity": {"type": "string",
+                              "description": "Who to be when this call creates the session: words matched against ~/.webscout/identities/*.toml, e.g. 'phone samsung', 'iphone', 'tablet android', 'windows edge', 'linux firefox', 'iqoo-13'. Ignored-with-error if the session already exists as something else."},
+                "proxy": {"type": "string", "description": "New sessions only: http(s):// or socks5:// proxy, the real way to change the IP sites see."},
+                "forwarded_for": {"type": "string", "description": "New sessions only: send X-Forwarded-For/X-Real-IP with this IP ('random' ok). Fools only naive servers; bot walls see it as a bot signal."},
                 "mobile": {"type": "boolean", "default": False,
-                            "description": "Use a mobile browser identity (phone UA + viewport). Applies when the session is first created."},
-                "render": {"type": "boolean", "default": False,
-                            "description": "Also render the page to a PNG and return it as an image, so you can see the page live."},
+                            "description": "Shorthand for identity='phone' (new sessions only)."},
             },
             "required": ["url"],
         },
     },
     {
-        "name": "screenshot",
+        "name": "handoff",
         "description": (
-            "Render a PNG of the page. Three engines: 'page' (default) is "
-            "WebScout's Chrome-free DOM layout/paint engine — it renders the "
-            "page's real structure (headings, paragraphs, lists, tables, "
-            "links, images, forms) faithfully, fetching images with the "
-            "session's cookies. No browser required. 'card' builds a curated "
-            "article summary with the og:image hero + a few inline images "
-            "(best for social-card previews). 'chrome' shells out to headless "
-            "Chrome for a pixel-perfect browser screenshot (requires Chrome "
-            "installed; doesn't inherit session cookies). Returns "
-            "base64-encoded PNG. Use height to clip a long page to the top "
-            "fold; omit it to capture the full page."
+            "Let a human through a page webscout can't pass (captcha, bot wall, "
+            "login): opens it in a real Chrome. On a desktop a Chrome window "
+            "appears for the user; on a headless machine the user opens the "
+            "returned view_url in any browser to drive it remotely. When they're "
+            "through, call handoff_done (or pass until_cookie / until_url to "
+            "finish automatically). The session then takes over Chrome's cookies "
+            "AND its exact fingerprint, so later scrapes look like the same "
+            "browser that passed. Tell the user what to do and give them view_url."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "url": {"type": "string"},
-                "engine": {"type": "string", "enum": ["page", "card", "chrome"], "default": "page",
-                            "description": "Which renderer to use."},
-                "width": {"type": "integer", "default": 1024},
-                "height": {"type": "integer",
-                            "description": "Max height in px. 0/omitted = full page (page/card) or 800 (chrome); a value clips to the top fold."},
-                "js": {"type": "boolean", "default": False},
-                "js_timeout_ms": {"type": "integer", "default": 5000},
-                "strategy": {"type": "string", "enum": ["plain", "js", "stealth"]},
-                "session": {"type": "string"},
-                "mobile": {"type": "boolean", "default": False,
-                            "description": "Render with a mobile identity at phone width."},
+                "session": {"type": "string", "description": f"Session to hand the result to (default '{DEFAULT_SESSION}')."},
+                "headless": {"type": "boolean", "description": "Default: only when there's no display."},
+                "until_cookie": {"type": "string", "description": "Finish once Chrome holds this cookie (e.g. cf_clearance, datadome, _px3)."},
+                "until_url": {"type": "string", "description": "Finish once the page URL contains this."},
             },
             "required": ["url"],
         },
+    },
+    {
+        "name": "handoff_status",
+        "description": "Where a handoff is: status (waiting/done/closed/cancelled), current URL and title, plus a screenshot of the remote page while waiting.",
+        "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]},
+    },
+    {
+        "name": "handoff_done",
+        "description": "Finish a handoff now: take Chrome's cookies + fingerprint into the session and close Chrome.",
+        "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]},
     },
     {
         "name": "extract_links",
@@ -396,6 +413,8 @@ def handle_scrape(args: dict):
         body["js_timeout_ms"] = int(args["js_timeout_ms"])
     if "delay" in args and args["delay"]:
         body["delay"] = args["delay"]
+    if args.get("actions"):
+        body["actions"] = args["actions"]
     _with_session(body, args)
 
     data, _ctype = _post_json("/scrape", body)
@@ -409,48 +428,36 @@ def handle_scrape(args: dict):
     else:
         text = str(data)
 
-    # render=true: also hand back a PNG of the page so the caller can see it.
-    if args.get("render"):
-        shot_body = {"url": args["url"], "engine": "page",
-                     "js": bool(args.get("js", False))}
-        _with_session(shot_body, args)
-        try:
-            payload, _ = _post_json("/screenshot", shot_body, want_bytes=True)
-            b64 = base64.b64encode(payload).decode("ascii")
-            return [
-                {"type": "text", "text": text},
-                {"type": "image", "data": b64, "mimeType": "image/png"},
-                {"type": "text", "text": f"Rendered {len(payload)} byte PNG of {args['url']}."},
-            ]
-        except EngineError as exc:
-            return [
-                {"type": "text", "text": text},
-                {"type": "text", "text": f"(render failed: {exc})"},
-            ]
-
     return text
 
 
-def handle_screenshot(args: dict) -> list:
-    body = {
-        "url": args["url"],
-        "js": bool(args.get("js", False)),
-        "width": int(args.get("width", 1024)),
-    }
-    if "height" in args:
-        body["height"] = int(args["height"])
-    if "engine" in args and args["engine"]:
-        body["engine"] = args["engine"]
-    if "js_timeout_ms" in args:
-        body["js_timeout_ms"] = int(args["js_timeout_ms"])
-    _with_session(body, args)
+def handle_handoff(args: dict) -> str:
+    body = {"url": args["url"], "session": args.get("session") or DEFAULT_SESSION}
+    for k in ("headless", "until_cookie", "until_url"):
+        if k in args and args[k] not in (None, ""):
+            body[k] = args[k]
+    data, _ = _post_json("/handoff", body)
+    how = ("open view_url in any browser and get through the page"
+           if data.get("headless") else "a Chrome window opened on this machine; get through the page there")
+    return json.dumps(data, indent=2) + f"\n\nUser: {how}, then I'll call handoff_done (id {data.get('id')})."
 
-    payload, _ctype = _post_json("/screenshot", body, want_bytes=True)
-    b64 = base64.b64encode(payload).decode("ascii")
-    return [
-        {"type": "image", "data": b64, "mimeType": "image/png"},
-        {"type": "text", "text": f"Rendered {len(payload)} byte PNG of {args['url']}."},
-    ]
+
+def handle_handoff_status(args: dict):
+    data, _ = _get_json(f"/handoff/{args['id']}")
+    out = [{"type": "text", "text": json.dumps(data, indent=2)}]
+    if data.get("status") == "waiting":
+        try:
+            frame, _ = _get_json(f"/handoff/{args['id']}/frame")
+            if frame.get("data"):
+                out.append({"type": "image", "data": frame["data"], "mimeType": "image/jpeg"})
+        except EngineError:
+            pass
+    return out
+
+
+def handle_handoff_done(args: dict) -> str:
+    data, _ = _post_json(f"/handoff/{args['id']}/done", {})
+    return json.dumps(data, indent=2)
 
 
 def _extract(path: str, args: dict) -> str:
@@ -504,7 +511,9 @@ def handle_session_clear(args: dict) -> str:
 
 HANDLERS = {
     "scrape":            handle_scrape,
-    "screenshot":        handle_screenshot,
+    "handoff":           handle_handoff,
+    "handoff_status":    handle_handoff_status,
+    "handoff_done":      handle_handoff_done,
     "extract_links":     handle_extract_links,
     "extract_forms":     handle_extract_forms,
     "extract_metadata":  handle_extract_metadata,

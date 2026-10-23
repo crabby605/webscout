@@ -252,14 +252,16 @@
   // WebGL: answers the queries fingerprinters make (vendor, renderer, limits,
   // extensions) with values matching the identity's browser/OS; draws nothing.
   // ponytail: one GPU per browser/OS combo; readPixels stays all-zero.
-  const ua = navigator.userAgent, win = __ws_config.platform === "Windows";
+  // identities/*.toml hold the GPU strings Chrome reports; Firefox rounds them off
+  // ("..., or similar") and Safari always says "Apple GPU".
+  const ua = navigator.userAgent, dev = __ws_config.device, { vendor: gv, renderer: gr } = dev.gpu;
   const firefox = /Firefox\//.test(ua), chromium = /Chrome\//.test(ua);
-  const gpu = firefox
-    ? (win ? ["Google Inc. (Intel)", "ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0), or similar"] : ["Apple", "Apple M2, or similar"])
-    : chromium
-      ? (win ? ["Google Inc. (Intel)", "ANGLE (Intel, Intel(R) UHD Graphics 630 (0x00003E92) Direct3D11 vs_5_0 ps_5_0, D3D11)"]
-             : ["Google Inc. (Apple)", "ANGLE (Apple, ANGLE Metal Renderer: Apple M2, Unspecified Version)"])
-      : ["Apple Inc.", "Apple GPU"];
+  const metal = (gr.match(/Metal Renderer: ([^,]+)/) || [])[1];
+  const gpu = chromium ? [gv, gr]
+    : !firefox ? ["Apple Inc.", "Apple GPU"]
+    : metal ? ["Apple", `${metal}, or similar`]
+    : dev.os === "windows" ? [gv, `${gr.replace(/ \(0x[0-9a-f]+\)/i, "").replace(/, D3D11\)$/, ")")}, or similar`]
+    : [gv, `${gr.replace(/^ANGLE \([^,]+, /, "").replace(/, OpenGL[^)]*\)$/, "")}, or similar`];
   const GL = {
     VENDOR: 0x1F00, RENDERER: 0x1F01, VERSION: 0x1F02, SHADING_LANGUAGE_VERSION: 0x8B8C,
     MAX_TEXTURE_SIZE: 0x0D33, MAX_VIEWPORT_DIMS: 0x0D3A, MAX_RENDERBUFFER_SIZE: 0x84E8, MAX_CUBE_MAP_TEXTURE_SIZE: 0x851C,
@@ -371,8 +373,37 @@
   for (const n of ["SVGAnimatedString", "SVGAnimatedLength", "SVGAnimatedNumber", "SVGLength", "SVGGraphicsElement", "SVGSVGElement"]) {
     def(n, (L[n] || { [n]: class {} }[n]));
   }
+  // Media queries answered from the identity's device: width, orientation, pointer, hover...
+  const touchFirst = dev.kind !== "desktop";
+  const px = v => parseFloat(v) * (/em$/.test(v) ? 16 : 1);
+  const feature = (name, v) => {
+    const [kind, f] = /^(min|max)-/.test(name) ? [name.slice(0, 3), name.slice(4)] : ["eq", name];
+    const actual = { width: innerWidth, height: innerHeight, "device-width": screen.width, "device-height": screen.height,
+      resolution: devicePixelRatio, "-webkit-device-pixel-ratio": devicePixelRatio, "device-pixel-ratio": devicePixelRatio }[f.replace(/^-webkit-(min|max)-/, "-webkit-")];
+    if (actual !== undefined) {
+      if (v === undefined) return actual > 0;
+      const want = /dppx|x$/.test(v) ? parseFloat(v) : /dpi$/.test(v) ? parseFloat(v) / 96 : f.includes("ratio") ? parseFloat(v) : px(v);
+      return kind === "min" ? actual >= want : kind === "max" ? actual <= want : actual === want;
+    }
+    const fixed = { orientation: innerWidth > innerHeight ? "landscape" : "portrait",
+      pointer: touchFirst ? "coarse" : "fine", "any-pointer": touchFirst ? "coarse" : "fine",
+      hover: touchFirst ? "none" : "hover", "any-hover": touchFirst ? "none" : "hover",
+      "prefers-color-scheme": "light", "prefers-reduced-motion": "no-preference", "prefers-contrast": "no-preference",
+      "display-mode": "browser", "color-gamut": "srgb", "forced-colors": "none", "inverted-colors": "none", scripting: "enabled" }[f];
+    return fixed !== undefined && (v === undefined ? fixed !== "none" && fixed !== "no-preference" : fixed === v);
+  };
+  const query = q => q.split(",").some(part => {
+    let s = part.trim().toLowerCase(), not = false;
+    if (s.startsWith("not ")) { not = true; s = s.slice(4); }
+    s = s.replace(/^only /, "");
+    const ok = s.split(/\s+and\s+/).every(t => {
+      const m = t.match(/^\(\s*([\w-]+)\s*(?::\s*([^)]+?))?\s*\)$/);
+      return m ? feature(m[1], m[2]) : t === "all" || t === "screen";
+    });
+    return ok !== not;
+  });
   G.MediaQueryList = class MediaQueryList extends L.EventTarget {
-    constructor(media) { super(); this.media = media; this.matches = false; this.onchange = null; }
+    constructor(media) { super(); this.media = media; this.matches = query(media); this.onchange = null; }
     addListener() {}
     removeListener() {}
   };
