@@ -314,6 +314,33 @@ fn install_host_fns<'js>(
         buf
     })?)?;
 
+    // crypto.subtle backing, hashes named as in WebCrypto. None = unsupported algorithm.
+    g.set("__ws_digest", Function::new(ctx.clone(), |alg: String, data: Vec<u8>| -> Option<Vec<u8>> {
+        use sha2::Digest;
+        Some(match alg.as_str() {
+            "SHA-1" => sha1::Sha1::digest(&data).to_vec(),
+            "SHA-256" => sha2::Sha256::digest(&data).to_vec(),
+            "SHA-384" => sha2::Sha384::digest(&data).to_vec(),
+            "SHA-512" => sha2::Sha512::digest(&data).to_vec(),
+            _ => return None,
+        })
+    })?)?;
+    g.set("__ws_hmac", Function::new(ctx.clone(), |alg: String, key: Vec<u8>, data: Vec<u8>| -> Option<Vec<u8>> {
+        use hmac::{Hmac, Mac, digest::KeyInit};
+        fn mac<M: Mac + KeyInit>(key: &[u8], data: &[u8]) -> Vec<u8> {
+            let mut m = <M as KeyInit>::new_from_slice(key).expect("HMAC takes any key length");
+            m.update(data);
+            m.finalize().into_bytes().to_vec()
+        }
+        Some(match alg.as_str() {
+            "SHA-1" => mac::<Hmac<sha1::Sha1>>(&key, &data),
+            "SHA-256" => mac::<Hmac<sha2::Sha256>>(&key, &data),
+            "SHA-384" => mac::<Hmac<sha2::Sha384>>(&key, &data),
+            "SHA-512" => mac::<Hmac<sha2::Sha512>>(&key, &data),
+            _ => return None,
+        })
+    })?)?;
+
     g.set("__ws_log", Function::new(ctx.clone(), move |level: String, msg: String| {
         push_log(&logs, &level, &msg);
     })?)?;
@@ -326,17 +353,21 @@ mod tests {
     use crate::session::Session;
 
     async fn run(html: &'static str, timeout_ms: u64) -> Rendered {
-        run_actions(html, timeout_ms, serde_json::json!([])).await
+        run_at("https://ex.com/a/b?q=1", html, timeout_ms, serde_json::json!([])).await
     }
 
     async fn run_actions(html: &'static str, timeout_ms: u64, actions: serde_json::Value) -> Rendered {
+        run_at("https://ex.com/a/b?q=1", html, timeout_ms, actions).await
+    }
+
+    async fn run_at(url: &'static str, html: &'static str, timeout_ms: u64, actions: serde_json::Value) -> Rendered {
         let session = Session::new();
         let client = HttpClient::build(&session).unwrap();
         let identity = session.identity.clone();
         let cookies = Arc::clone(&session.cookies);
         let actions = actions.as_array().unwrap().clone();
         tokio::task::spawn_blocking(move || render(Page {
-            html, url: "https://ex.com/a/b?q=1", identity: &identity, client, cookies,
+            html, url, identity: &identity, client, cookies,
             timeout: Duration::from_millis(timeout_ms), actions: &actions,
         })).await.unwrap().unwrap()
     }
@@ -470,6 +501,45 @@ mod tests {
         assert_eq!(out, json!(["$1,234.50", "1,234,567.891", "1/2/2026", "yesterday", "a, b, and c", true, true,
             // Blob's promise (microtask) settles before the MessageChannel message (task), as in browsers.
             "<img height=\"4\" width=\"3\">", "function", "v", "AbortError", "abc", "msg:1", "ws closed"]), "{:?}", r.console);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn subtle_crypto() {
+        let r = run(r#"<html><body><pre id=out></pre><script>
+            const hex = b => [...new Uint8Array(b)].map(x => x.toString(16).padStart(2, '0')).join('');
+            const enc = s => new TextEncoder().encode(s);
+            (async () => {
+              const out = [hex(await crypto.subtle.digest('SHA-256', enc('abc')))];
+              const key = await crypto.subtle.importKey('raw', enc('key'), {name: 'HMAC', hash: 'SHA-256'}, false, ['sign', 'verify']);
+              const sig = await crypto.subtle.sign('HMAC', key, enc('The quick brown fox jumps over the lazy dog'));
+              out.push(hex(sig), await crypto.subtle.verify('HMAC', key, sig, enc('The quick brown fox jumps over the lazy dog')),
+                await crypto.subtle.verify('HMAC', key, sig, enc('tampered')), String(key), String(crypto.subtle));
+              out.push(await crypto.subtle.digest('MD5', enc('x')).catch(e => e.name));
+              out.push(await crypto.subtle.digest('SHA-256', 'abc').catch(e => e.name));
+              const vkey = await crypto.subtle.importKey('raw', enc('key'), {name: 'HMAC', hash: 'SHA-256'}, false, ['verify']);
+              out.push(await crypto.subtle.sign('HMAC', vkey, enc('x')).catch(e => e.name));
+              out.push(await crypto.subtle.importKey('raw', enc('key'), {name: 'HMAC', hash: 'SHA-256'}, false, ['encrypt']).catch(e => e.name));
+              document.getElementById('out').textContent = JSON.stringify(out);
+            })();
+            </script></body></html>"#, 5000).await;
+        let d = crate::dom::Dom::parse(&r.html, "https://ex.com/");
+        let text = d.select_text("#out").unwrap().pop().unwrap_or_default();
+        let out: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|_| panic!("no output; console: {:?}", r.console));
+        assert_eq!(out, json!([
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8", true, false,
+            "[object CryptoKey]", "[object SubtleCrypto]", "NotSupportedError", "TypeError", "InvalidAccessError", "SyntaxError"]),
+            "{:?}", r.console);
+
+        // [SecureContext]: absent on plain http, present on http://localhost.
+        let probe = r#"<html><body><script>document.body.textContent =
+            JSON.stringify([isSecureContext, typeof crypto.subtle, typeof SubtleCrypto, typeof CryptoKey]);</script></body></html>"#;
+        for (url, want) in [("http://ex.com/", json!([false, "undefined", "undefined", "undefined"])),
+                            ("http://localhost:3000/", json!([true, "object", "function", "function"]))] {
+            let r = run_at(url, probe, 5000, json!([])).await;
+            let text = crate::dom::Dom::parse(&r.html, url).select_text("body").unwrap().pop().unwrap_or_default();
+            assert_eq!(serde_json::from_str::<serde_json::Value>(&text).unwrap(), want, "{url}: {:?}", r.console);
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

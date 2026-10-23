@@ -234,7 +234,7 @@
     devicePixelRatio: dev.dpr, scrollX: 0, scrollY: 0, pageXOffset: 0, pageYOffset: 0,
     scrollTo() {}, scroll() {}, scrollBy() {}, focus() {}, blur() {}, print() {},
     alert() {}, confirm: () => false, prompt: () => null, open: () => null, close() {},
-    isSecureContext: loc.protocol === "https:",
+    isSecureContext: loc.protocol === "https:" || /^127\.|^\[::1\]$|(^|\.)localhost$/.test(loc.hostname),
   });
   // Touch devices expose ontouch* handlers; their presence is the classic mobile check.
   if (dev.touch && !ipad) for (const t of [G, document]) for (const e of ["touchstart", "touchend", "touchmove", "touchcancel"]) t[`on${e}`] = null;
@@ -405,8 +405,58 @@
       const h = b.map(x => x.toString(16).padStart(2, "0")).join("");
       return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
     },
-    // ponytail: no SubtleCrypto (digest/sign); back it with Rust (ring is already linked) if a site needs it.
   };
+  // SubtleCrypto: digest + HMAC (raw keys) via Rust. Bytes cross as plain arrays.
+  // [SecureContext] in browsers: on http pages crypto.subtle, SubtleCrypto and CryptoKey don't exist.
+  // ponytail: no AES/RSA/ECDSA/PBKDF2, generateKey or exportKey; add per algorithm when a site calls it.
+  if (G.isSecureContext) {
+    const keyBytes = new WeakMap();
+    const bytesOf = d => {
+      if (ArrayBuffer.isView(d)) return Array.from(new Uint8Array(d.buffer, d.byteOffset, d.byteLength));
+      if (d instanceof ArrayBuffer) return Array.from(new Uint8Array(d));
+      throw new TypeError("parameter is not of type '(ArrayBuffer or ArrayBufferView)'.");
+    };
+    const algName = a => String(typeof a === "string" ? a : a && a.name).toUpperCase();
+    const unsupported = () => new DOMException("Algorithm: Unrecognized name", "NotSupportedError");
+    const CryptoKey = iface("CryptoKey");
+    const hmacOf = (key, usage, data) => {
+      if (!(key instanceof CryptoKey) || key.algorithm.name !== "HMAC" || !key.usages.includes(usage))
+        throw new DOMException("key.usages does not permit this operation", "InvalidAccessError");
+      return __ws_hmac(key.algorithm.hash.name, keyBytes.get(key), bytesOf(data));
+    };
+    const SubtleCrypto = iface("SubtleCrypto", {
+      async digest(alg, data) {
+        const bytes = bytesOf(data);
+        const out = __ws_digest(algName(alg), bytes);
+        if (!out) throw unsupported();
+        return new Uint8Array(out).buffer;
+      },
+      async importKey(format, keyData, alg, extractable, usages) {
+        const hash = algName(alg.hash), bytes = bytesOf(keyData);
+        if (format !== "raw" || algName(alg) !== "HMAC" || !__ws_digest(hash, [])) throw unsupported();
+        if (!usages.length) throw new DOMException("Usages cannot be empty when creating a key.", "SyntaxError");
+        if (usages.some(u => u !== "sign" && u !== "verify"))
+          throw new DOMException("Cannot create a key using the specified key usages.", "SyntaxError");
+        const key = Object.create(CryptoKey.prototype);
+        Object.defineProperties(key, {
+          type: { value: "secret" }, extractable: { value: !!extractable },
+          algorithm: { value: { name: "HMAC", hash: { name: hash }, length: bytes.length * 8 } }, usages: { value: [...usages] },
+        });
+        keyBytes.set(key, bytes);
+        return key;
+      },
+      async sign(alg, key, data) {
+        if (algName(alg) !== "HMAC") throw unsupported();
+        return new Uint8Array(hmacOf(key, "sign", data)).buffer;
+      },
+      async verify(alg, key, sig, data) {
+        if (algName(alg) !== "HMAC") throw unsupported();
+        const got = bytesOf(sig), want = hmacOf(key, "verify", data);
+        return want.length === got.length && want.every((b, i) => b === got[i]);
+      },
+    });
+    G.crypto.subtle = Object.create(SubtleCrypto.prototype);
+  }
   // Legacy element constructors.
   G.Image = function Image(width, height) {
     const img = document.createElement("img");
