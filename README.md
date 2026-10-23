@@ -8,7 +8,7 @@ header order and JavaScript environment all agree with each other. When a site s
 insists on a human (captcha, bot wall, login), WebScout opens a real Chrome for someone to
 get through. It then takes over that browser's cookies and fingerprint and carries on.
 
-![WebScout scraping Hacker News, running page JavaScript, browsing as an iPhone and logging in with actions](docs/demo.gif)
+![WebScout scraping Hacker News, running page JavaScript, browsing as an iPhone, Android phone and Windows PC, logging in with actions, and hashing with WebCrypto](docs/demo.gif)
 
 ## Features
 
