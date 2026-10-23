@@ -4,6 +4,7 @@ pub mod handoff;
 pub mod identity;
 pub mod js;
 pub mod session;
+pub mod subtle;
 pub mod http;
 pub mod serve;
 

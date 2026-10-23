@@ -406,55 +406,200 @@
       return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
     },
   };
-  // SubtleCrypto: digest + HMAC (raw keys) via Rust. Bytes cross as plain arrays.
+  // SubtleCrypto via Rust (src/subtle.rs): digest, HMAC, AES-GCM, RSA-OAEP, ECDSA P-256, PBKDF2.
+  // Key material lives in a WeakMap: bytes for secret keys, canonical JWK JSON for RSA/EC keys.
   // [SecureContext] in browsers: on http pages crypto.subtle, SubtleCrypto and CryptoKey don't exist.
-  // ponytail: no AES/RSA/ECDSA/PBKDF2, generateKey or exportKey; add per algorithm when a site calls it.
+  // ponytail: no AES-CBC/CTR/KW, RSA-PSS/RSASSA-PKCS1, ECDH, P-384/521 or HKDF; add per algorithm when a site calls it.
   if (G.isSecureContext) {
-    const keyBytes = new WeakMap();
-    const bytesOf = d => {
-      if (ArrayBuffer.isView(d)) return Array.from(new Uint8Array(d.buffer, d.byteOffset, d.byteLength));
-      if (d instanceof ArrayBuffer) return Array.from(new Uint8Array(d));
+    const material = new WeakMap();
+    const u8 = d => {
+      if (ArrayBuffer.isView(d)) return new Uint8Array(d.buffer, d.byteOffset, d.byteLength);
+      if (d instanceof ArrayBuffer) return new Uint8Array(d);
       throw new TypeError("parameter is not of type '(ArrayBuffer or ArrayBufferView)'.");
     };
-    const algName = a => String(typeof a === "string" ? a : a && a.name).toUpperCase();
-    const unsupported = () => new DOMException("Algorithm: Unrecognized name", "NotSupportedError");
-    const CryptoKey = iface("CryptoKey");
-    const hmacOf = (key, usage, data) => {
-      if (!(key instanceof CryptoKey) || key.algorithm.name !== "HMAC" || !key.usages.includes(usage))
-        throw new DOMException("key.usages does not permit this operation", "InvalidAccessError");
-      return __ws_hmac(key.algorithm.hash.name, keyBytes.get(key), bytesOf(data));
+    const none = new Uint8Array(0);
+    const random = n => G.crypto.getRandomValues(new Uint8Array(n));
+    const b64u = b => btoa(String.fromCharCode(...b)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    const unb64u = s => Uint8Array.from(atob(s.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((s.length + 3) % 4)), c => c.charCodeAt(0));
+    const err = (name, msg) => new DOMException(msg, name);
+    const unsupported = () => err("NotSupportedError", "Algorithm: Unrecognized name");
+    const NAMES = ["SHA-1", "SHA-256", "SHA-384", "SHA-512", "HMAC", "AES-GCM", "RSA-OAEP", "ECDSA", "PBKDF2"];
+    const norm = a => (typeof a === "string" ? { name: a } : a) ?? {};
+    const canon = (a, ok) => {
+      const n = String(norm(a).name).toUpperCase();
+      if (!ok.includes(n)) throw unsupported();
+      return n;
     };
-    const SubtleCrypto = iface("SubtleCrypto", {
+    const hashOf = a => canon(a, NAMES.slice(0, 4));
+    const blockBits = h => h === "SHA-384" || h === "SHA-512" ? 1024 : 512;
+    const KTY = { "RSA-OAEP": "RSA", ECDSA: "EC" };
+    const USAGES = {
+      HMAC: { secret: ["sign", "verify"] },
+      "AES-GCM": { secret: ["encrypt", "decrypt", "wrapKey", "unwrapKey"] },
+      PBKDF2: { secret: ["deriveBits", "deriveKey"] },
+      "RSA-OAEP": { public: ["encrypt", "wrapKey"], private: ["decrypt", "unwrapKey"] },
+      ECDSA: { public: ["verify"], private: ["sign"] },
+    };
+    const ORDER = ["encrypt", "decrypt", "sign", "verify", "deriveKey", "deriveBits", "wrapKey", "unwrapKey"];
+    const CryptoKey = iface("CryptoKey");
+    const makeKey = (type, extractable, algorithm, usages, data) => {
+      const allowed = USAGES[algorithm.name][type];
+      if (usages.some(u => !allowed.includes(u))) throw err("SyntaxError", "Cannot create a key using the specified key usages.");
+      if (!usages.length && type !== "public") throw err("SyntaxError", "Usages cannot be empty when creating a key.");
+      const key = Object.create(CryptoKey.prototype);
+      Object.defineProperties(key, {
+        type: { value: type }, extractable: { value: type === "public" || !!extractable },
+        algorithm: { value: algorithm }, usages: { value: ORDER.filter(u => usages.includes(u)) },
+      });
+      material.set(key, data);
+      return key;
+    };
+    const use = (key, name, usage) => {
+      if (!(key instanceof CryptoKey)) throw new TypeError("parameter is not of type 'CryptoKey'.");
+      if (key.algorithm.name !== name) throw err("InvalidAccessError", "key.algorithm does not match that of operation");
+      if (!key.usages.includes(usage)) throw err("InvalidAccessError", "key.usages does not permit this operation");
+      return material.get(key);
+    };
+    const secretKey = (name, alg, raw, extractable, usages) => {
+      let algorithm = { name };
+      if (name === "HMAC") {
+        const bits = raw.length * 8, length = alg.length ?? bits;
+        if (!length || length > bits || length <= bits - 8)
+          throw err("DataError", "The optional HMAC key length must be shorter than the key data, and by less than 8 bits.");
+        algorithm = { name, hash: { name: hashOf(alg.hash) }, length };
+      } else if (name === "AES-GCM") {
+        if (raw.length !== 16 && raw.length !== 32) throw err("DataError", "AES key data must be 128 or 256 bits");
+        algorithm = { name, length: raw.length * 8 };
+      } else if (extractable) throw err("SyntaxError", "PBKDF2 keys must not be extractable");
+      return makeKey("secret", extractable, algorithm, usages, raw);
+    };
+    const asymKey = (name, alg, jwk, extractable, usages) => {
+      const { n, e, d } = JSON.parse(jwk);
+      const algorithm = name === "ECDSA" ? { name, namedCurve: "P-256" }
+        : { name, modulusLength: unb64u(n).length * 8, publicExponent: unb64u(e), hash: { name: hashOf(alg.hash) } };
+      return makeKey(d ? "private" : "public", extractable, algorithm, usages, jwk);
+    };
+    const publicOf = jwk => {
+      const { kty, n, e, crv, x, y } = JSON.parse(jwk);
+      return JSON.stringify(kty === "RSA" ? { kty, n, e } : { kty, crv, x, y });
+    };
+    const checkCurve = (name, alg) => { if (name === "ECDSA" && alg.namedCurve !== "P-256") throw unsupported(); };
+    const badFormat = () => err("NotSupportedError", "Unsupported key format for algorithm");
+    const cipher = (alg, key, data, encrypt, usage) => {
+      const d = u8(data), name = canon(alg, ["AES-GCM", "RSA-OAEP"]);
+      alg = norm(alg);
+      const m = use(key, name, usage);
+      let out;
+      if (name === "AES-GCM") {
+        if ((alg.tagLength ?? 128) !== 128) throw unsupported();
+        out = __ws_aes_gcm(encrypt, m, u8(alg.iv), u8(alg.additionalData ?? none), d);
+      } else out = __ws_rsa_oaep(encrypt, key.algorithm.hash.name, m, u8(alg.label ?? none), d);
+      if (!out) throw err("OperationError", "");
+      return out;
+    };
+    const pbkdf2 = (alg, key, length, usage) => {
+      const name = canon(alg, ["PBKDF2"]);
+      alg = norm(alg);
+      const m = use(key, name, usage);
+      if (length == null || length % 8) throw err("OperationError", "length must be a multiple of 8 bits");
+      if (!alg.iterations) throw err("OperationError", "PBKDF2 requires iterations > 0");
+      return __ws_pbkdf2(hashOf(alg.hash), m, u8(alg.salt), alg.iterations, length / 8);
+    };
+    const S = {
       async digest(alg, data) {
-        const bytes = bytesOf(data);
-        const out = __ws_digest(algName(alg), bytes);
-        if (!out) throw unsupported();
-        return new Uint8Array(out).buffer;
+        const d = u8(data);
+        return __ws_digest(hashOf(alg), d);
       },
-      async importKey(format, keyData, alg, extractable, usages) {
-        const hash = algName(alg.hash), bytes = bytesOf(keyData);
-        if (format !== "raw" || algName(alg) !== "HMAC" || !__ws_digest(hash, [])) throw unsupported();
-        if (!usages.length) throw new DOMException("Usages cannot be empty when creating a key.", "SyntaxError");
-        if (usages.some(u => u !== "sign" && u !== "verify"))
-          throw new DOMException("Cannot create a key using the specified key usages.", "SyntaxError");
-        const key = Object.create(CryptoKey.prototype);
-        Object.defineProperties(key, {
-          type: { value: "secret" }, extractable: { value: !!extractable },
-          algorithm: { value: { name: "HMAC", hash: { name: hash }, length: bytes.length * 8 } }, usages: { value: [...usages] },
-        });
-        keyBytes.set(key, bytes);
-        return key;
+      async importKey(format, data, alg, extractable, usages) {
+        const name = canon(alg, NAMES.slice(4));
+        alg = norm(alg);
+        usages = [...usages];
+        if (!KTY[name]) {
+          let raw;
+          if (format === "raw") raw = u8(data).slice();
+          else if (format === "jwk" && name !== "PBKDF2") {
+            if (data?.kty !== "oct") throw err("DataError", "The JWK \"kty\" member was not \"oct\"");
+            try { raw = unb64u(data.k); } catch { throw err("DataError", "The JWK \"k\" member was not valid base64url"); }
+          } else throw badFormat();
+          return secretKey(name, alg, raw, extractable, usages);
+        }
+        checkCurve(name, alg);
+        if (format === "raw" ? name !== "ECDSA" : !["spki", "pkcs8", "jwk"].includes(format)) throw badFormat();
+        const jwk = __ws_jwk_from(KTY[name], format, format === "jwk" ? new TextEncoder().encode(JSON.stringify(data)) : u8(data));
+        if (!jwk) throw err("DataError", "Invalid keyData");
+        return asymKey(name, alg, jwk, extractable, usages);
       },
+      async exportKey(format, key) {
+        if (!(key instanceof CryptoKey)) throw new TypeError("parameter 2 is not of type 'CryptoKey'.");
+        if (!key.extractable) throw err("InvalidAccessError", "key is not extractable");
+        const m = material.get(key), a = key.algorithm;
+        if (format === "jwk") {
+          const jwk = typeof m === "string" ? JSON.parse(m) : { kty: "oct", k: b64u(m) };
+          const alg = a.name === "HMAC" ? "HS" + a.hash.name.slice(4) : a.name === "AES-GCM" ? `A${a.length}GCM`
+            : a.name === "RSA-OAEP" ? "RSA-OAEP" + (a.hash.name === "SHA-1" ? "" : "-" + a.hash.name.slice(4)) : undefined;
+          return Object.assign(jwk, alg && { alg }, { ext: true, key_ops: [...key.usages] });
+        }
+        if (typeof m !== "string") {
+          if (format !== "raw") throw badFormat();
+          return m.slice().buffer;
+        }
+        if (format === "raw" ? a.name !== "ECDSA" : !["spki", "pkcs8"].includes(format)) throw badFormat();
+        if ((format === "pkcs8") !== (key.type === "private")) throw err("InvalidAccessError", "key type does not match the export format");
+        return __ws_jwk_to(format, m);
+      },
+      async generateKey(alg, extractable, usages) {
+        const name = canon(alg, NAMES.slice(4, 8));
+        alg = norm(alg);
+        usages = [...usages];
+        if (name === "HMAC") {
+          const length = alg.length ?? blockBits(hashOf(alg.hash));
+          return secretKey(name, { ...alg, length }, random(Math.ceil(length / 8)), extractable, usages);
+        }
+        if (name === "AES-GCM") {
+          if (alg.length !== 128 && alg.length !== 256) throw err("OperationError", "AES key length must be 128 or 256 bits");
+          return secretKey(name, alg, random(alg.length / 8), extractable, usages);
+        }
+        checkCurve(name, alg);
+        if (name === "RSA-OAEP") hashOf(alg.hash);
+        const { public: pub, private: priv } = USAGES[name];
+        if (usages.some(u => !pub.includes(u) && !priv.includes(u))) throw err("SyntaxError", "Cannot create a key using the specified key usages.");
+        const jwk = __ws_jwk_gen(KTY[name], alg.modulusLength | 0, u8(alg.publicExponent ?? new Uint8Array([1, 0, 1])));
+        if (!jwk) throw err("OperationError", "Failed to generate key");
+        return {
+          publicKey: asymKey(name, alg, publicOf(jwk), true, usages.filter(u => pub.includes(u))),
+          privateKey: asymKey(name, alg, jwk, extractable, usages.filter(u => priv.includes(u))),
+        };
+      },
+      async encrypt(alg, key, data) { return cipher(alg, key, data, true, "encrypt"); },
+      async decrypt(alg, key, data) { return cipher(alg, key, data, false, "decrypt"); },
       async sign(alg, key, data) {
-        if (algName(alg) !== "HMAC") throw unsupported();
-        return new Uint8Array(hmacOf(key, "sign", data)).buffer;
+        const d = u8(data), name = canon(alg, ["HMAC", "ECDSA"]);
+        const m = use(key, name, "sign");
+        return name === "HMAC" ? __ws_hmac(key.algorithm.hash.name, m, d) : __ws_ecdsa_sign(hashOf(norm(alg).hash), m, d);
       },
       async verify(alg, key, sig, data) {
-        if (algName(alg) !== "HMAC") throw unsupported();
-        const got = bytesOf(sig), want = hmacOf(key, "verify", data);
-        return want.length === got.length && want.every((b, i) => b === got[i]);
+        const s = u8(sig), d = u8(data), name = canon(alg, ["HMAC", "ECDSA"]);
+        const m = use(key, name, "verify");
+        if (name === "ECDSA") return __ws_ecdsa_verify(hashOf(norm(alg).hash), m, d, s);
+        const want = new Uint8Array(__ws_hmac(key.algorithm.hash.name, m, d));
+        return want.length === s.length && want.every((b, i) => b === s[i]);
       },
-    });
+      async deriveBits(alg, key, length) { return pbkdf2(alg, key, length, "deriveBits"); },
+      async deriveKey(alg, key, derived, extractable, usages) {
+        const name = canon(derived, ["HMAC", "AES-GCM"]), d = norm(derived);
+        const length = name === "HMAC" ? d.length ?? blockBits(hashOf(d.hash)) : d.length;
+        return S.importKey("raw", pbkdf2(alg, key, length, "deriveKey"), derived, extractable, usages);
+      },
+      async wrapKey(format, key, wrappingKey, wrapAlg) {
+        const data = await S.exportKey(format, key);
+        return cipher(wrapAlg, wrappingKey, format === "jwk" ? new TextEncoder().encode(JSON.stringify(data)) : data, true, "wrapKey");
+      },
+      async unwrapKey(format, wrapped, unwrappingKey, unwrapAlg, keyAlg, extractable, usages) {
+        const data = cipher(unwrapAlg, unwrappingKey, wrapped, false, "unwrapKey");
+        return S.importKey(format, format === "jwk" ? JSON.parse(new TextDecoder().decode(data)) : data, keyAlg, extractable, usages);
+      },
+    };
+    const SubtleCrypto = iface("SubtleCrypto", S);
     G.crypto.subtle = Object.create(SubtleCrypto.prototype);
   }
   // Legacy element constructors.

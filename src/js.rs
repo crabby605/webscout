@@ -314,32 +314,7 @@ fn install_host_fns<'js>(
         buf
     })?)?;
 
-    // crypto.subtle backing, hashes named as in WebCrypto. None = unsupported algorithm.
-    g.set("__ws_digest", Function::new(ctx.clone(), |alg: String, data: Vec<u8>| -> Option<Vec<u8>> {
-        use sha2::Digest;
-        Some(match alg.as_str() {
-            "SHA-1" => sha1::Sha1::digest(&data).to_vec(),
-            "SHA-256" => sha2::Sha256::digest(&data).to_vec(),
-            "SHA-384" => sha2::Sha384::digest(&data).to_vec(),
-            "SHA-512" => sha2::Sha512::digest(&data).to_vec(),
-            _ => return None,
-        })
-    })?)?;
-    g.set("__ws_hmac", Function::new(ctx.clone(), |alg: String, key: Vec<u8>, data: Vec<u8>| -> Option<Vec<u8>> {
-        use hmac::{Hmac, Mac, digest::KeyInit};
-        fn mac<M: Mac + KeyInit>(key: &[u8], data: &[u8]) -> Vec<u8> {
-            let mut m = <M as KeyInit>::new_from_slice(key).expect("HMAC takes any key length");
-            m.update(data);
-            m.finalize().into_bytes().to_vec()
-        }
-        Some(match alg.as_str() {
-            "SHA-1" => mac::<Hmac<sha1::Sha1>>(&key, &data),
-            "SHA-256" => mac::<Hmac<sha2::Sha256>>(&key, &data),
-            "SHA-384" => mac::<Hmac<sha2::Sha384>>(&key, &data),
-            "SHA-512" => mac::<Hmac<sha2::Sha512>>(&key, &data),
-            _ => return None,
-        })
-    })?)?;
+    crate::subtle::install(ctx, &g)?;
 
     g.set("__ws_log", Function::new(ctx.clone(), move |level: String, msg: String| {
         push_log(&logs, &level, &msg);
@@ -540,6 +515,72 @@ mod tests {
             let text = crate::dom::Dom::parse(&r.html, url).select_text("body").unwrap().pop().unwrap_or_default();
             assert_eq!(serde_json::from_str::<serde_json::Value>(&text).unwrap(), want, "{url}: {:?}", r.console);
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn subtle_crypto_algorithms() {
+        let r = run(r#"<html><body><pre id=out></pre><script>
+            const s = crypto.subtle, enc = x => new TextEncoder().encode(x);
+            const hex = b => [...new Uint8Array(b)].map(x => x.toString(16).padStart(2, '0')).join('');
+            const name = p => p.then(() => 'resolved', e => e.name);
+            (async () => {
+              const out = {};
+              // AES-GCM: NIST GCM test case 2 (zero key, IV, plaintext), then round trip and tamper.
+              const aes = await s.importKey('raw', new Uint8Array(16), 'AES-GCM', true, ['encrypt', 'decrypt', 'wrapKey', 'unwrapKey']);
+              const iv = new Uint8Array(12), ct = await s.encrypt({name: 'AES-GCM', iv}, aes, new Uint8Array(16));
+              out.aes = [hex(ct), hex(await s.decrypt({name: 'AES-GCM', iv}, aes, ct)),
+                await name(s.decrypt({name: 'AES-GCM', iv}, aes, new Uint8Array(ct).fill(1, 0, 1)))];
+              // PBKDF2: RFC 6070 vector, and deriveKey into a usable AES key.
+              const pw = await s.importKey('raw', enc('password'), 'PBKDF2', false, ['deriveBits', 'deriveKey']);
+              const p2 = {name: 'PBKDF2', hash: 'SHA-1', salt: enc('salt'), iterations: 1};
+              const dk = await s.deriveKey(p2, pw, {name: 'AES-GCM', length: 256}, false, ['encrypt']);
+              out.pbkdf2 = [hex(await s.deriveBits(p2, pw, 160)), dk.algorithm.length, (await s.encrypt({name: 'AES-GCM', iv}, dk, enc('x'))).byteLength];
+              // HMAC: jwk round trip, generateKey defaults, wrap/unwrap with AES-GCM.
+              const hk = await s.importKey('raw', enc('key'), {name: 'HMAC', hash: 'SHA-256'}, true, ['sign', 'verify']);
+              const jwk = await s.exportKey('jwk', hk);
+              const hk2 = await s.importKey('jwk', jwk, {name: 'HMAC', hash: 'SHA-256'}, true, ['sign']);
+              const gen = await s.generateKey({name: 'HMAC', hash: 'SHA-512'}, true, ['sign']);
+              const wrapped = await s.wrapKey('jwk', hk, aes, {name: 'AES-GCM', iv});
+              const hk3 = await s.unwrapKey('jwk', wrapped, aes, {name: 'AES-GCM', iv}, {name: 'HMAC', hash: 'SHA-256'}, false, ['sign']);
+              out.hmac = [jwk.kty, jwk.k, jwk.alg, jwk.key_ops.join(), hex(await s.sign('HMAC', hk2, enc('m'))) === hex(await s.sign('HMAC', hk, enc('m'))),
+                gen.algorithm.length, hex(await s.sign('HMAC', hk3, enc('m'))) === hex(await s.sign('HMAC', hk, enc('m'))),
+                await name(s.importKey('raw', enc('key'), {name: 'HMAC', hash: 'SHA-256', length: 16}, false, ['sign']))];
+              // ECDSA P-256: sign/verify, raw + jwk round trips, private keys can't export spki.
+              const ec = await s.generateKey({name: 'ECDSA', namedCurve: 'P-256'}, true, ['sign', 'verify']);
+              const es = {name: 'ECDSA', hash: 'SHA-256'}, sig = await s.sign(es, ec.privateKey, enc('m'));
+              const rawPub = await s.exportKey('raw', ec.publicKey);
+              const pub2 = await s.importKey('raw', rawPub, {name: 'ECDSA', namedCurve: 'P-256'}, false, ['verify']);
+              const priv2 = await s.importKey('jwk', await s.exportKey('jwk', ec.privateKey), {name: 'ECDSA', namedCurve: 'P-256'}, false, ['sign']);
+              const pkcs8 = await s.exportKey('pkcs8', ec.privateKey);
+              const priv3 = await s.importKey('pkcs8', pkcs8, {name: 'ECDSA', namedCurve: 'P-256'}, false, ['sign']);
+              out.ecdsa = [sig.byteLength, await s.verify(es, ec.publicKey, sig, enc('m')), await s.verify(es, ec.publicKey, sig, enc('n')),
+                new Uint8Array(rawPub)[0], rawPub.byteLength, await s.verify(es, pub2, await s.sign(es, priv2, enc('m')), enc('m')),
+                await s.verify(es, ec.publicKey, await s.sign(es, priv3, enc('m')), enc('m')),
+                ec.publicKey.usages.join(), ec.privateKey.usages.join(), ec.publicKey.extractable,
+                await name(s.exportKey('spki', ec.privateKey)), await name(s.importKey('raw', rawPub, {name: 'ECDSA', namedCurve: 'P-384'}, false, ['verify']))];
+              // RSA-OAEP: generate, spki round trip, label must match, publicExponent/modulusLength reported.
+              const rsa = await s.generateKey({name: 'RSA-OAEP', modulusLength: 1024, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256'},
+                true, ['encrypt', 'decrypt']);
+              const spki = await s.exportKey('spki', rsa.publicKey);
+              const pubR = await s.importKey('spki', spki, {name: 'RSA-OAEP', hash: 'SHA-256'}, true, ['encrypt']);
+              const oa = {name: 'RSA-OAEP', label: enc('L')}, rct = await s.encrypt(oa, pubR, enc('secret'));
+              out.rsa = [rct.byteLength, new TextDecoder().decode(await s.decrypt(oa, rsa.privateKey, rct)),
+                await name(s.decrypt({name: 'RSA-OAEP'}, rsa.privateKey, rct)), rsa.publicKey.algorithm.modulusLength,
+                [...rsa.publicKey.algorithm.publicExponent].join(), (await s.exportKey('jwk', rsa.privateKey)).alg,
+                await name(s.importKey('pkcs8', await s.exportKey('pkcs8', rsa.privateKey), {name: 'RSA-OAEP', hash: 'SHA-256'}, false, ['decrypt']))];
+              document.getElementById('out').textContent = JSON.stringify(out);
+            })().catch(e => console.error('subtle test failed: ' + e.name + ': ' + e.message));
+            </script></body></html>"#, 30000).await;
+        let d = crate::dom::Dom::parse(&r.html, "https://ex.com/");
+        let text = d.select_text("#out").unwrap().pop().unwrap_or_default();
+        let out: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|_| panic!("no output; console: {:?}", r.console));
+        assert_eq!(out, json!({
+            "aes": ["0388dace60b6a392f328c2b971b2fe78ab6e47d42cec13bdf53a67b21257bddf", "00000000000000000000000000000000", "OperationError"],
+            "pbkdf2": ["0c60c80f961f0e71f3a9b524af6012062fe037a6", 256, 17],
+            "hmac": ["oct", "a2V5", "HS256", "sign,verify", true, 1024, true, "DataError"],
+            "ecdsa": [64, true, false, 4, 65, true, true, "verify", "sign", true, "InvalidAccessError", "NotSupportedError"],
+            "rsa": [128, "secret", "OperationError", 1024, "1,0,1", "RSA-OAEP-256", "resolved"],
+        }), "{:?}", r.console);
     }
 
     #[tokio::test(flavor = "multi_thread")]
